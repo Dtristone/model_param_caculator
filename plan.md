@@ -231,9 +231,15 @@ python main.py --config configs/qwen2_7b.json --seq-len 2048 --batch-size 1
 # Analyse with flash attention
 python main.py --config configs/glm4_9b.json --seq-len 4096 --flash-attn
 
-# Show only parameter summary
-python main.py --config configs/qwen2_7b.json --mode params
+# Use a different dtype
+python main.py --config configs/qwen2_7b.json --seq-len 1024 --dtype fp32
 
-# Show computation breakdown
-python main.py --config configs/qwen2_7b.json --seq-len 1024 --mode compute
+# Plain text output (no rich tables)
+python main.py --config configs/qwen2_7b.json --seq-len 2048 --plain
+
+# Skip the ASCII architecture diagram
+python main.py --config configs/qwen2_7b.json --no-diagram
+
+# Analyse a MoE model
+python main.py --config configs/mixtral_8x7b.json --seq-len 1024 --flash-attn
 ```

@@ -230,10 +230,10 @@ class TestFFNStats:
         matmul_flops = 4 * B * s * h * ffn_h
         assert stats.flops >= matmul_flops
 
-    def test_swiglu_has_3_children(self):
+    def test_swiglu_has_4_children(self):
         """gate, up, activation+mul, down = 4 children."""
         stats = ffn_stats(512, 2048, ffn_type="swiglu")
-        assert len(stats.children) == 4
+        assert len(stats.children) == 4  # gate, up, SiLU+mul, down
 
     def test_standard_has_3_children(self):
         """up, activation, down = 3 children."""
@@ -408,6 +408,11 @@ class TestConfigParser:
     def test_glm4_gqa(self):
         cfg = _glm4_cfg()
         assert cfg.attention_type == "GQA"
+
+    def test_glm4_norm_type(self):
+        """GLM-4-9B has rmsnorm=True in config, so norm_type should be rmsnorm."""
+        cfg = _glm4_cfg()
+        assert cfg.norm_type == "rmsnorm"
 
     def test_from_dict(self):
         """from_dict should produce a valid ModelConfig."""

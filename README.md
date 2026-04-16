@@ -87,3 +87,42 @@ See [plan.md](plan.md) for the full derivation of all formulas including:
 - HBM access models for standard vs. flash attention
 - Arithmetic intensity and roofline analysis
 - MoE active vs. total parameter accounting
+
+## Possible Improvements
+
+The following enhancements could be added in the future:
+
+1. **KV Cache Memory Estimation** — Model KV cache memory for auto-regressive decode
+   (per-layer KV cache = `2 × batch × seq_len × kv_heads × head_dim × elem_size`),
+   and track how it grows during generation.
+
+2. **Backward Pass / Training FLOPs** — Add a training mode that estimates backward-pass
+   FLOPs (~2× forward) and optimizer state memory (Adam stores fp32 weights + momentum +
+   variance ≈ 12 bytes per parameter for mixed-precision training).
+
+3. **Multi-GPU Parallelism Modeling** — Model tensor parallelism (TP), pipeline
+   parallelism (PP), and data parallelism (DP) to estimate per-GPU memory and
+   communication overhead (all-reduce, point-to-point).
+
+4. **Roofline Performance Prediction** — Accept GPU hardware specs (peak TFLOPS, HBM
+   bandwidth in GB/s) and predict actual kernel wall time using the roofline model
+   (`time = max(FLOPs/peak_flops, HBM_bytes/bandwidth)`).
+
+5. **More Architecture Support** — Add configs and parser handling for Falcon, MPT, Phi-3,
+   DeepSeek-V2 (MLA attention), Gemma, Command-R, and other emerging architectures.
+
+6. **HuggingFace Hub Integration** — Auto-download `config.json` from the HuggingFace Hub
+   by model ID (e.g. `python main.py --model Qwen/Qwen2-7B-Instruct`).
+
+7. **JSON/CSV Export** — Add `--output-format json` and `--output-format csv` options to
+   export the computed statistics for programmatic consumption and comparison.
+
+8. **Model Comparison Mode** — Side-by-side comparison of two or more models to visualise
+   trade-offs in parameters, FLOPs, and memory.
+
+9. **Activation Checkpointing Analysis** — Estimate memory savings from gradient/activation
+   checkpointing during training (trade compute for memory).
+
+10. **Quantization-Aware Modeling** — More accurate FLOPs estimates for quantized models
+    (INT8/INT4) which often use dequantize→matmul→requantize patterns with different
+    arithmetic intensity characteristics.

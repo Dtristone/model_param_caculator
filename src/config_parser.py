@@ -157,8 +157,15 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
     norm = "rmsnorm"
     if _get(cfg, "norm_type", default="") == "layernorm":
         norm = "layernorm"
-    elif model_type in ("gpt2", "gpt_neo", "bloom", "chatglm"):
+    elif model_type in ("gpt2", "gpt_neo", "bloom"):
         norm = "layernorm"
+    elif model_type == "chatglm":
+        # GLM-4 has an explicit "rmsnorm" boolean field.  When it is True
+        # the model uses RMSNorm; otherwise fall back to LayerNorm (older GLM).
+        if _get(cfg, "rmsnorm", default=False):
+            norm = "rmsnorm"
+        else:
+            norm = "layernorm"
 
     # MoE ——————————————————————————————————————————————————————————————————
     num_experts = int(_get(cfg, "num_experts", "num_local_experts", default=0))
