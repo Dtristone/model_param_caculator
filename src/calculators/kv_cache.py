@@ -128,7 +128,7 @@ def kv_cache_stats(
 
         # Reference: standard MHA cache for same model
         # MHA equivalent: 2 * num_q_heads * head_dim_equivalent
-        mha_equiv = 2 * num_kv_heads * (head_dim if head_dim > 0 else 128)
+        mha_equiv = 2 * num_q_heads * (head_dim if head_dim > 0 else 128)
     else:
         # Standard GQA/MHA/MQA
         k_per_token = num_kv_heads * head_dim

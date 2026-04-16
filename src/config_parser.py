@@ -201,7 +201,8 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
             norm = "layernorm"
 
     # MoE ——————————————————————————————————————————————————————————————————
-    num_experts = int(_get(cfg, "num_experts", "num_local_experts", default=0))
+    num_experts = int(_get(cfg, "num_experts", "num_local_experts",
+                          "n_routed_experts", default=0))
     experts_per_tok = int(_get(cfg, "num_experts_per_tok", "num_selected_experts",
                                "top_k", default=2 if num_experts > 0 else 0))
     moe_inter = int(_get(cfg, "moe_intermediate_size", default=0))

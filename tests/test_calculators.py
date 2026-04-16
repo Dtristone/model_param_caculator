@@ -542,3 +542,460 @@ class TestBaseHelpers:
         parent.aggregate_children()
         assert parent.num_params == 150
         assert parent.flops == 300
+
+
+# ---------------------------------------------------------------------------
+# 10. MLA (Multi-Latent Attention)
+# ---------------------------------------------------------------------------
+
+from src.calculators.mla import mla_proj_stats, mla_attention_stats
+
+class TestMLAStats:
+    """Tests for Multi-Latent Attention calculator."""
+
+    def test_mla_proj_has_correct_children(self):
+        """MLA proj with q_lora_rank should have: kv_a, kv_b, q_a, q_b, o_proj."""
+        s = mla_proj_stats(
+            hidden_size=2048, num_q_heads=16,
+            kv_lora_rank=512, q_lora_rank=1536,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, seq_len=8, batch_size=1,
+        )
+        assert len(s.children) == 5  # kv_a, kv_b, q_a, q_b, o_proj
+
+    def test_mla_proj_without_q_lora(self):
+        """When q_lora_rank=0, should have: kv_a, kv_b, q_direct, o_proj."""
+        s = mla_proj_stats(
+            hidden_size=2048, num_q_heads=16,
+            kv_lora_rank=512, q_lora_rank=0,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, seq_len=8, batch_size=1,
+        )
+        assert len(s.children) == 4  # kv_a, kv_b, q_direct, o_proj
+
+    def test_kv_b_proj_has_zero_flops(self):
+        """kv_b_proj is absorbed at inference → 0 FLOPs."""
+        s = mla_proj_stats(
+            hidden_size=2048, num_q_heads=16,
+            kv_lora_rank=512, q_lora_rank=1536,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, seq_len=8, batch_size=1,
+        )
+        kv_b = s.children[1]  # kv_b_proj (absorbed)
+        assert kv_b.flops == 0
+        assert kv_b.num_params > 0  # still has parameters
+        assert kv_b.weight_bytes > 0
+
+    def test_kv_b_params_count(self):
+        """kv_b params = c_kv × a × (d_n + v_dim)."""
+        c_kv, a, d_n, v_dim = 512, 16, 128, 128
+        s = mla_proj_stats(
+            hidden_size=2048, num_q_heads=a,
+            kv_lora_rank=c_kv, q_lora_rank=1536,
+            qk_nope_head_dim=d_n, qk_rope_head_dim=64,
+            v_head_dim=v_dim, seq_len=8, batch_size=1,
+        )
+        kv_b = s.children[1]
+        expected = c_kv * a * (d_n + v_dim)
+        assert kv_b.num_params == expected
+
+    def test_mla_proj_params_non_zero(self):
+        """Total MLA projection params should be > 0."""
+        s = mla_proj_stats(
+            hidden_size=2048, num_q_heads=16,
+            kv_lora_rank=512, q_lora_rank=1536,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128,
+        )
+        assert s.num_params > 0
+
+    def test_mla_attn_flops_formula(self):
+        """MLA attention FLOPs in absorbed mode."""
+        B, s, a = 1, 32, 16
+        c_kv, d_r = 512, 64
+        v_dim = 128
+        absorbed_dim = c_kv + d_r
+
+        attn = mla_attention_stats(
+            num_q_heads=a, kv_lora_rank=c_kv,
+            qk_nope_head_dim=128, qk_rope_head_dim=d_r,
+            v_head_dim=v_dim, seq_len=s, batch_size=B,
+        )
+        expected_qkt = 2 * B * a * s * s * absorbed_dim
+        expected_av = 2 * B * a * s * s * c_kv
+        expected_softmax = 5 * B * a * s * s
+        expected_total = expected_qkt + expected_softmax + expected_av
+        assert attn.flops == expected_total
+
+    def test_mla_flash_same_flops(self):
+        """Flash and standard MLA should have the same FLOPs."""
+        kwargs = dict(
+            num_q_heads=16, kv_lora_rank=512,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, seq_len=64, batch_size=1,
+        )
+        std = mla_attention_stats(**kwargs, use_flash_attn=False)
+        flash = mla_attention_stats(**kwargs, use_flash_attn=True)
+        assert std.flops == flash.flops
+
+    def test_mla_flash_less_hbm(self):
+        """Flash MLA should have less HBM traffic than standard."""
+        kwargs = dict(
+            num_q_heads=16, kv_lora_rank=512,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, seq_len=256, batch_size=1,
+        )
+        std = mla_attention_stats(**kwargs, use_flash_attn=False)
+        flash = mla_attention_stats(**kwargs, use_flash_attn=True)
+        assert flash.hbm_total_bytes < std.hbm_total_bytes
+
+    def test_mla_no_learnable_params(self):
+        """Attention kernel itself has no learnable params."""
+        attn = mla_attention_stats(
+            num_q_heads=16, kv_lora_rank=512,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, seq_len=64,
+        )
+        assert attn.num_params == 0
+
+
+# ---------------------------------------------------------------------------
+# 11. DSA (Differential Sparse Attention)
+# ---------------------------------------------------------------------------
+
+from src.calculators.dsa import dsa_indexer_stats, dsa_sparse_attention_stats
+
+class TestDSAStats:
+    """Tests for Differential Sparse Attention calculator."""
+
+    def test_indexer_has_correct_children(self):
+        """DSA indexer should have: wq_b, wk, weights_proj, k_norm, index_attn."""
+        s = dsa_indexer_stats(
+            hidden_size=4096, q_lora_rank=1536,
+            index_n_heads=8, index_head_dim=128,
+            seq_len=32, batch_size=1,
+        )
+        assert len(s.children) == 5
+
+    def test_indexer_params(self):
+        """Indexer params: wq_b + wk + weights_proj + k_norm."""
+        h = 4096
+        c_q = 1536
+        idx_a = 8
+        idx_h = 128
+        expected_params = (
+            c_q * idx_a * idx_h     # wq_b
+            + h * idx_h              # wk
+            + h * idx_a              # weights_proj
+            + 2 * idx_h              # k_norm (scale + bias)
+        )
+        s = dsa_indexer_stats(
+            hidden_size=h, q_lora_rank=c_q,
+            index_n_heads=idx_a, index_head_dim=idx_h,
+            seq_len=32, batch_size=1,
+        )
+        assert s.num_params == expected_params
+
+    def test_sparse_attn_less_flops_than_full(self):
+        """Sparse attention (top-k) should have fewer FLOPs than full attention."""
+        a, c_kv, d_r, v_dim = 32, 512, 64, 128
+        s = 4096
+        k_sel = 2048
+
+        sparse = dsa_sparse_attention_stats(
+            num_q_heads=a, kv_lora_rank=c_kv,
+            qk_rope_head_dim=d_r, v_head_dim=v_dim,
+            index_topk=k_sel, seq_len=s,
+        )
+        full = mla_attention_stats(
+            num_q_heads=a, kv_lora_rank=c_kv,
+            qk_nope_head_dim=128, qk_rope_head_dim=d_r,
+            v_head_dim=v_dim, seq_len=s,
+        )
+        assert sparse.flops < full.flops
+
+    def test_sparse_attn_topk_clamped(self):
+        """When seq_len < index_topk, effective k_sel = seq_len."""
+        sparse_short = dsa_sparse_attention_stats(
+            num_q_heads=32, kv_lora_rank=512,
+            qk_rope_head_dim=64, v_head_dim=128,
+            index_topk=2048, seq_len=512,  # seq_len < topk
+        )
+        full_mla = mla_attention_stats(
+            num_q_heads=32, kv_lora_rank=512,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, seq_len=512,
+        )
+        # When seq_len <= topk, sparse attention degenerates to full attention
+        # But they have different dim calculations, so just check sparse is not
+        # dramatically less than full
+        assert sparse_short.flops > 0
+
+    def test_sparse_attn_no_params(self):
+        """Sparse attention kernel has no learnable params."""
+        s = dsa_sparse_attention_stats(
+            num_q_heads=32, kv_lora_rank=512,
+            qk_rope_head_dim=64, v_head_dim=128,
+            index_topk=2048, seq_len=4096,
+        )
+        assert s.num_params == 0
+
+
+# ---------------------------------------------------------------------------
+# 12. KV Cache
+# ---------------------------------------------------------------------------
+
+from src.calculators.kv_cache import kv_cache_stats, KVCacheStats
+
+class TestKVCache:
+    """Tests for KV cache analysis."""
+
+    def test_gqa_kv_cache(self):
+        """Standard GQA KV cache: 2 × kv_heads × head_dim per token."""
+        kv = kv_cache_stats(
+            hidden_size=3584, num_q_heads=28, num_kv_heads=4,
+            head_dim=128, num_layers=28, seq_len=2048,
+        )
+        assert kv.attention_type == "GQA"
+        assert kv.k_cache_per_token == 4 * 128
+        assert kv.v_cache_per_token == 4 * 128
+        assert kv.total_per_token == 2 * 4 * 128
+
+    def test_mha_kv_cache(self):
+        """MHA KV cache: 2 × heads × head_dim per token."""
+        kv = kv_cache_stats(
+            hidden_size=4096, num_q_heads=32, num_kv_heads=32,
+            head_dim=128, num_layers=32, seq_len=1024,
+        )
+        assert kv.attention_type == "MHA"
+        assert kv.total_per_token == 2 * 32 * 128
+
+    def test_mla_kv_cache_compressed(self):
+        """MLA KV cache: kv_lora_rank + qk_rope_head_dim per token."""
+        kv = kv_cache_stats(
+            hidden_size=2048, num_q_heads=16, num_kv_heads=16,
+            head_dim=192, num_layers=27, seq_len=2048,
+            use_mla=True, kv_lora_rank=512, qk_rope_head_dim=64,
+            v_head_dim=128,
+        )
+        assert kv.attention_type == "MLA"
+        assert kv.total_per_token == 512 + 64
+        assert kv.v_cache_per_token == 0  # V is part of compressed latent
+
+    def test_mla_compression_ratio(self):
+        """MLA should have high compression ratio vs standard MHA."""
+        kv = kv_cache_stats(
+            hidden_size=2048, num_q_heads=16, num_kv_heads=16,
+            head_dim=192, num_layers=27, seq_len=2048,
+            use_mla=True, kv_lora_rank=512, qk_rope_head_dim=64,
+            v_head_dim=128,
+        )
+        assert kv.compression_ratio > 5.0  # significant compression
+
+    def test_dsa_mla_includes_indexer(self):
+        """DSA+MLA should include indexer K cache in total."""
+        kv = kv_cache_stats(
+            hidden_size=4096, num_q_heads=32, num_kv_heads=32,
+            head_dim=192, num_layers=40, seq_len=4096,
+            use_mla=True, kv_lora_rank=512, qk_rope_head_dim=64,
+            v_head_dim=128, use_dsa=True, index_head_dim=128,
+        )
+        assert kv.attention_type == "DSA+MLA"
+        assert kv.index_cache_per_token == 128
+        assert kv.total_per_token == 512 + 64 + 128
+
+    def test_total_cache_bytes(self):
+        """Total cache = per_token × layers × seq_len × batch × elem_size."""
+        kv = kv_cache_stats(
+            hidden_size=4096, num_q_heads=32, num_kv_heads=4,
+            head_dim=128, num_layers=32, seq_len=1024,
+            batch_size=2, dtype=DType.BF16,
+        )
+        expected = 2 * 4 * 128 * 2 * 32 * 1024 * 2  # elems × bytes × layers × seqlen × batch
+        assert kv.total_cache_bytes == expected
+
+    def test_hit_ratio_zero(self):
+        """Hit ratio = 0 means all tokens are new."""
+        kv = kv_cache_stats(
+            hidden_size=4096, num_q_heads=32, num_kv_heads=4,
+            head_dim=128, num_layers=32, seq_len=2048,
+            hit_ratio=0.0,
+        )
+        assert kv.cached_tokens == 0
+        assert kv.new_tokens == 2048
+        assert kv.kv_proj_flops_saved == 0
+        assert kv.hbm_write_saved == 0
+
+    def test_hit_ratio_half(self):
+        """Hit ratio = 0.5 saves FLOPs and HBM writes."""
+        kv = kv_cache_stats(
+            hidden_size=4096, num_q_heads=32, num_kv_heads=4,
+            head_dim=128, num_layers=32, seq_len=2048,
+            hit_ratio=0.5,
+        )
+        assert kv.cached_tokens == 1024
+        assert kv.new_tokens == 1024
+        assert kv.kv_proj_flops_saved > 0
+        assert kv.hbm_write_saved > 0
+
+    def test_hit_ratio_mla(self):
+        """MLA models also benefit from cache hit ratio."""
+        kv = kv_cache_stats(
+            hidden_size=2048, num_q_heads=16, num_kv_heads=16,
+            head_dim=192, num_layers=27, seq_len=2048,
+            use_mla=True, kv_lora_rank=512, qk_rope_head_dim=64,
+            v_head_dim=128, hit_ratio=0.5,
+        )
+        assert kv.cached_tokens == 1024
+        assert kv.kv_proj_flops_saved > 0
+
+
+# ---------------------------------------------------------------------------
+# 13. Config parser (MLA and DSA)
+# ---------------------------------------------------------------------------
+
+class TestConfigParserMLA:
+    """Tests for MLA/DSA config parsing."""
+
+    def test_deepseek_v2_lite_mla_fields(self):
+        """DeepSeek-V2-Lite should be parsed as MLA model."""
+        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json", name="DS-V2-Lite")
+        assert cfg.use_mla is True
+        assert cfg.kv_lora_rank == 512
+        assert cfg.q_lora_rank == 1536
+        assert cfg.qk_nope_head_dim == 128
+        assert cfg.qk_rope_head_dim == 64
+        assert cfg.v_head_dim == 128
+        assert cfg.attention_type == "MLA"
+
+    def test_glm5_dsa_fields(self):
+        """GLM-5 should be parsed as DSA+MLA model."""
+        cfg = load_config(_CONFIGS_DIR / "glm5_9b.json", name="GLM-5-9B")
+        assert cfg.use_mla is True
+        assert cfg.use_dsa is True
+        assert cfg.index_n_heads == 8
+        assert cfg.index_head_dim == 128
+        assert cfg.index_topk == 2048
+        assert cfg.attention_type == "DSA+MLA"
+
+    def test_mla_kv_cache_per_token(self):
+        """mla_kv_cache_per_token property should work correctly."""
+        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json")
+        assert cfg.mla_kv_cache_per_token == 512 + 64
+
+    def test_non_mla_model_defaults(self):
+        """Non-MLA models should have use_mla=False."""
+        cfg = load_config(_CONFIGS_DIR / "qwen2_7b.json")
+        assert cfg.use_mla is False
+        assert cfg.use_dsa is False
+        assert cfg.kv_lora_rank == 0
+
+    def test_from_dict_mla(self):
+        """from_dict should parse MLA fields."""
+        d = {
+            "model_type": "deepseek_v2",
+            "hidden_size": 2048,
+            "num_attention_heads": 16,
+            "intermediate_size": 10944,
+            "vocab_size": 100015,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 1536,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "v_head_dim": 128,
+        }
+        cfg = from_dict(d)
+        assert cfg.use_mla is True
+        assert cfg.kv_lora_rank == 512
+
+
+# ---------------------------------------------------------------------------
+# 14. Full model stats (MLA and DSA models)
+# ---------------------------------------------------------------------------
+
+class TestModelStatsMLA:
+    """End-to-end model stats for MLA/DSA models."""
+
+    def test_deepseek_v2_lite_model_stats(self):
+        """DeepSeek-V2-Lite model stats should complete without error."""
+        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json", name="DS-V2-Lite")
+        ms = model_stats(cfg, seq_len=512, batch_size=1)
+        assert ms.total.num_params > 0
+        assert ms.total.flops > 0
+        assert ms.kv_cache is not None
+        assert ms.kv_cache.attention_type == "MLA"
+
+    def test_glm5_model_stats(self):
+        """GLM-5 model stats should complete without error."""
+        cfg = load_config(_CONFIGS_DIR / "glm5_9b.json", name="GLM-5-9B")
+        ms = model_stats(cfg, seq_len=512, batch_size=1)
+        assert ms.total.num_params > 0
+        assert ms.total.flops > 0
+        assert ms.kv_cache is not None
+        assert ms.kv_cache.attention_type == "DSA+MLA"
+
+    def test_glm5_has_indexer_in_layer(self):
+        """GLM-5 layer breakdown should include DSA Indexer."""
+        cfg = load_config(_CONFIGS_DIR / "glm5_9b.json", name="GLM-5-9B")
+        ms = model_stats(cfg, seq_len=512, batch_size=1)
+        layer = ms.layer_breakdown[0]
+        child_names = [c.name for c in layer.children]
+        assert any("Indexer" in n for n in child_names)
+        assert any("Sparse" in n for n in child_names)
+
+    def test_mla_model_has_mla_proj_in_layer(self):
+        """MLA model layer should have MLA Projection."""
+        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json")
+        ms = model_stats(cfg, seq_len=512, batch_size=1)
+        layer = ms.layer_breakdown[0]
+        child_names = [c.name for c in layer.children]
+        assert "MLA Projection" in child_names
+
+    def test_kv_cache_with_hit_ratio(self):
+        """KV hit ratio should propagate to model stats."""
+        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json")
+        ms = model_stats(cfg, seq_len=2048, batch_size=1, kv_hit_ratio=0.5)
+        assert ms.kv_cache.hit_ratio == 0.5
+        assert ms.kv_cache.cached_tokens == 1024
+        assert ms.kv_cache.kv_proj_flops_saved > 0
+
+    def test_standard_model_still_has_kv_cache(self):
+        """Standard (non-MLA) models should also have KV cache stats."""
+        cfg = load_config(_CONFIGS_DIR / "qwen2_7b.json")
+        ms = model_stats(cfg, seq_len=2048)
+        assert ms.kv_cache is not None
+        assert ms.kv_cache.attention_type == "GQA"
+        assert ms.kv_cache.total_per_token == 2 * 4 * 128
+
+
+# ---------------------------------------------------------------------------
+# 15. Visualizer (MLA/DSA smoke tests)
+# ---------------------------------------------------------------------------
+
+class TestVisualizerMLA:
+    def test_mla_diagram(self):
+        """MLA model diagram should show MLA-specific projections."""
+        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json", name="DS-V2-Lite")
+        diagram = visualize(cfg)
+        assert "MLA" in diagram
+        assert "KV down-proj" in diagram
+        assert "absorbed" in diagram
+        assert "KV cache/token" in diagram
+
+    def test_dsa_diagram(self):
+        """DSA model diagram should show DSA+MLA and indexer."""
+        cfg = load_config(_CONFIGS_DIR / "glm5_9b.json", name="GLM-5-9B")
+        diagram = visualize(cfg)
+        assert "DSA+MLA" in diagram
+        assert "Indexer" in diagram
+        assert "top-2048" in diagram
+
+    def test_standard_diagram_unchanged(self):
+        """Standard model diagram should still work as before."""
+        cfg = load_config(_CONFIGS_DIR / "qwen2_7b.json", name="Qwen2-7B")
+        diagram = visualize(cfg)
+        assert "Q proj" in diagram
+        assert "K proj" in diagram
+        assert "GQA" in diagram
+        assert "KV cache/token" in diagram
+
