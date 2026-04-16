@@ -20,6 +20,7 @@ except ImportError:
 
 from .calculators.base import ComputeStats, fmt_num, fmt_bytes
 from .calculators.model import ModelStats
+from .calculators.kv_cache import KVCacheStats
 
 
 # ---------------------------------------------------------------------------
@@ -142,6 +143,10 @@ def _rich_report(ms: ModelStats) -> None:
     # ---- Attention comparison table (std vs flash) -------------------------
     _attn_comparison(console, ms)
 
+    # ---- KV Cache analysis -------------------------------------------------
+    if ms.kv_cache is not None:
+        _kv_cache_report(console, ms)
+
 
 def _attn_comparison(console, ms: ModelStats) -> None:
     """Print a flash vs standard attention HBM comparison."""
@@ -149,6 +154,10 @@ def _attn_comparison(console, ms: ModelStats) -> None:
 
     cfg = ms.config
     B, s = ms.batch_size, ms.seq_len
+
+    # Skip comparison for MLA/DSA models (different architecture)
+    if cfg.use_mla:
+        return
 
     std = attention_stats(
         hidden_size=cfg.hidden_size,
@@ -203,6 +212,48 @@ def _attn_comparison(console, ms: ModelStats) -> None:
     console.print(tbl)
 
 
+def _kv_cache_report(console, ms: ModelStats) -> None:
+    """Print KV cache analysis table."""
+    kv = ms.kv_cache
+    if kv is None:
+        return
+
+    tbl = Table(
+        title=f"KV Cache Analysis ({kv.attention_type})",
+        box=rich_box.SIMPLE_HEAD,
+    )
+    tbl.add_column("Metric", style="bold")
+    tbl.add_column("Value", style="cyan")
+
+    tbl.add_row("Attention Type", kv.attention_type)
+
+    if kv.k_cache_per_token > 0:
+        tbl.add_row("K cache per token", f"{kv.k_cache_per_token} elements")
+    if kv.v_cache_per_token > 0:
+        tbl.add_row("V cache per token", f"{kv.v_cache_per_token} elements")
+    if kv.index_cache_per_token > 0:
+        tbl.add_row("Indexer K cache per token", f"{kv.index_cache_per_token} elements")
+
+    tbl.add_row("Total per token per layer", f"{kv.total_per_token} elements")
+    tbl.add_row("Bytes per token per layer", fmt_bytes(kv.per_token_per_layer_bytes))
+    tbl.add_row("Bytes per token (all layers)", fmt_bytes(kv.per_token_all_layers_bytes))
+    tbl.add_row("Total KV cache", fmt_bytes(kv.total_cache_bytes))
+    tbl.add_row("Compression ratio vs MHA", f"{kv.compression_ratio:.1f}×")
+    tbl.add_row("Layers", str(kv.num_layers))
+    tbl.add_row("Seq len", str(kv.seq_len))
+    tbl.add_row("Batch size", str(kv.batch_size))
+
+    if kv.hit_ratio > 0:
+        tbl.add_row("", "")
+        tbl.add_row("[bold]Cache Hit Ratio[/bold]", f"{kv.hit_ratio:.1%}")
+        tbl.add_row("Cached tokens", str(kv.cached_tokens))
+        tbl.add_row("New tokens", str(kv.new_tokens))
+        tbl.add_row("KV proj FLOPs saved", fmt_num(kv.kv_proj_flops_saved))
+        tbl.add_row("HBM writes saved", fmt_bytes(kv.hbm_write_saved))
+
+    console.print(tbl)
+
+
 # ---------------------------------------------------------------------------
 # Plain-text fallback
 # ---------------------------------------------------------------------------
@@ -240,6 +291,20 @@ def _plain_report(ms: ModelStats) -> None:
         for child in one.children:
             print(f"  {child.name:<26} {fmt_num(child.num_params):>10} {fmt_num(child.flops):>10} "
                   f"{fmt_bytes(child.weight_bytes):>10} {fmt_bytes(child.hbm_total_bytes):>10}")
+
+    # KV Cache
+    if ms.kv_cache is not None:
+        kv = ms.kv_cache
+        print(f"\nKV Cache Analysis ({kv.attention_type}):")
+        print(f"  Per token per layer: {kv.total_per_token} elements = {fmt_bytes(kv.per_token_per_layer_bytes)}")
+        print(f"  Per token all layers: {fmt_bytes(kv.per_token_all_layers_bytes)}")
+        print(f"  Total KV cache: {fmt_bytes(kv.total_cache_bytes)}")
+        print(f"  Compression ratio vs MHA: {kv.compression_ratio:.1f}×")
+        if kv.hit_ratio > 0:
+            print(f"  Cache hit ratio: {kv.hit_ratio:.1%}")
+            print(f"  Cached/New tokens: {kv.cached_tokens}/{kv.new_tokens}")
+            print(f"  KV proj FLOPs saved: {fmt_num(kv.kv_proj_flops_saved)}")
+            print(f"  HBM writes saved: {fmt_bytes(kv.hbm_write_saved)}")
     print()
 
 

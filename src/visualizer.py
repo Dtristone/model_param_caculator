@@ -167,27 +167,69 @@ def visualize(cfg: ModelConfig, use_flash_attn: bool = False) -> str:
     lines.append(_inner_hline(W))
 
     # Attention projections
-    q_out = cfg.num_attention_heads * cfg.head_dim
-    kv_out = cfg.num_key_value_heads * cfg.head_dim
-    q_row   = f"Q proj    [{cfg.hidden_size} → {q_out}]"
-    q_right = f"{cfg.num_attention_heads} Q heads"
-    k_row   = f"K proj    [{cfg.hidden_size} → {kv_out}]"
-    k_right = f"{cfg.num_key_value_heads} KV heads"
-    v_row   = f"V proj    [{cfg.hidden_size} → {kv_out}]"
-    v_right = f"{cfg.num_key_value_heads} KV heads"
-
     inner_w = W - 6   # inner box content width
-    for row, right in [(q_row, q_right), (k_row, k_right), (v_row, v_right)]:
-        content = row + right.rjust(inner_w - len(row))
-        lines.append(_inner_line(content, W))
+    if cfg.use_mla:
+        # MLA projections
+        c_kv = cfg.kv_lora_rank
+        c_q = cfg.q_lora_rank
+        d_n = cfg.qk_nope_head_dim
+        d_r = cfg.qk_rope_head_dim
+        v_dim = cfg.v_head_dim
+        a = cfg.num_attention_heads
 
-    attn_mode = "flash attn" if use_flash_attn else "std attn"
-    prefix = f"── Attention ({attn_type}, {attn_mode}) "
-    attn_row = prefix + "─" * max(0, inner_w - len(prefix))
-    lines.append(_inner_line(attn_row, W))
+        lines.append(_inner_line(f"KV down-proj [{cfg.hidden_size} → {c_kv + d_r}]  (c_kv+d_r)", W))
+        kv_b_desc = f"KV up-proj   [{c_kv} → {a}×({d_n}+{v_dim})]  (absorbed)"
+        lines.append(_inner_line(kv_b_desc, W))
+        if c_q > 0:
+            lines.append(_inner_line(f"Q down-proj  [{cfg.hidden_size} → {c_q}]", W))
+            lines.append(_inner_line(f"Q up-proj    [{c_q} → {a}×{d_n + d_r}]", W))
+        else:
+            lines.append(_inner_line(f"Q proj       [{cfg.hidden_size} → {a}×{d_n + d_r}]", W))
 
-    o_row = f"O proj    [{cfg.hidden_size} → {cfg.hidden_size}]"
-    lines.append(_inner_line(o_row, W))
+        if cfg.use_dsa:
+            attn_mode = f"DSA top-{cfg.index_topk}"
+            prefix = f"── DSA+MLA Attention ({attn_mode}) "
+            lines.append(_inner_line(prefix + "─" * max(0, inner_w - len(prefix)), W))
+            idx_desc = f"Indexer: {cfg.index_n_heads}h×{cfg.index_head_dim}d"
+            lines.append(_inner_line(idx_desc, W))
+        else:
+            attn_mode = "flash" if use_flash_attn else "std"
+            prefix = f"── MLA Attention (absorbed, {attn_mode}) "
+            lines.append(_inner_line(prefix + "─" * max(0, inner_w - len(prefix)), W))
+
+        lines.append(_inner_line(f"O proj       [{a}×{v_dim} → {cfg.hidden_size}]", W))
+
+        # KV cache info
+        kv_info = f"KV cache/token: {c_kv + d_r}"
+        if cfg.use_dsa:
+            kv_info += f" + {cfg.index_head_dim} (indexer)"
+        kv_info += " elements"
+        lines.append(_inner_line(kv_info, W))
+    else:
+        q_out = cfg.num_attention_heads * cfg.head_dim
+        kv_out = cfg.num_key_value_heads * cfg.head_dim
+        q_row   = f"Q proj    [{cfg.hidden_size} → {q_out}]"
+        q_right = f"{cfg.num_attention_heads} Q heads"
+        k_row   = f"K proj    [{cfg.hidden_size} → {kv_out}]"
+        k_right = f"{cfg.num_key_value_heads} KV heads"
+        v_row   = f"V proj    [{cfg.hidden_size} → {kv_out}]"
+        v_right = f"{cfg.num_key_value_heads} KV heads"
+
+        for row, right in [(q_row, q_right), (k_row, k_right), (v_row, v_right)]:
+            content = row + right.rjust(inner_w - len(row))
+            lines.append(_inner_line(content, W))
+
+        attn_mode = "flash attn" if use_flash_attn else "std attn"
+        prefix = f"── Attention ({attn_type}, {attn_mode}) "
+        attn_row = prefix + "─" * max(0, inner_w - len(prefix))
+        lines.append(_inner_line(attn_row, W))
+
+        o_row = f"O proj    [{cfg.hidden_size} → {cfg.hidden_size}]"
+        lines.append(_inner_line(o_row, W))
+
+        # KV cache info for standard attention
+        kv_per_token = 2 * cfg.num_key_value_heads * cfg.head_dim
+        lines.append(_inner_line(f"KV cache/token: {kv_per_token} elements", W))
 
     lines.append(_inner_hline(W))
 

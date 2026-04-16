@@ -79,6 +79,12 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=False,
         help="Use plain-text output instead of rich tables.",
     )
+    parser.add_argument(
+        "--kv-hit-ratio",
+        type=float,
+        default=0.0,
+        help="KV cache hit ratio (0.0-1.0) for cache reuse analysis (default: 0.0).",
+    )
     return parser.parse_args(argv)
 
 
@@ -106,6 +112,7 @@ def main(argv=None) -> None:
         batch_size=args.batch_size,
         dtype=dtype,
         use_flash_attn=args.flash_attn,
+        kv_hit_ratio=args.kv_hit_ratio,
     )
 
     # Report --------------------------------------------------------------

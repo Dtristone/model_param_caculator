@@ -9,9 +9,9 @@ Model
 ├── Embedding
 ├── TransformerLayer × N
 │   ├── Input Norm
-│   ├── QKV Projection
-│   ├── Attention (Standard or Flash)
-│   ├── Output Projection
+│   ├── QKV Projection (or MLA Projection for MLA models)
+│   ├── Attention (Standard / Flash / MLA / DSA+MLA)
+│   ├── Output Projection (folded into MLA Projection for MLA models)
 │   ├── Post-Attention Norm
 │   └── FFN / MoE
 └── Final Norm + LM Head
@@ -20,7 +20,7 @@ Model
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import List
+from typing import List, Optional
 
 from ..config_parser import ModelConfig
 from .base import ComputeStats, DType, dtype_bytes
@@ -28,6 +28,9 @@ from .linear import qkv_proj_stats, output_proj_stats, LinearStats
 from .attention import attention_stats
 from .ffn import ffn_stats
 from .moe import moe_stats
+from .mla import mla_proj_stats, mla_attention_stats
+from .dsa import dsa_indexer_stats, dsa_sparse_attention_stats
+from .kv_cache import kv_cache_stats, KVCacheStats
 
 
 # ---------------------------------------------------------------------------
@@ -94,41 +97,96 @@ def _transformer_layer_stats(
     in_norm.name = f"Input {cfg.norm_type.upper()}"
     layer.children.append(in_norm)
 
-    # --- QKV projections ----------------------------------------------------
-    qkv = qkv_proj_stats(
-        hidden_size=h,
-        num_q_heads=cfg.num_attention_heads,
-        num_kv_heads=cfg.num_key_value_heads,
-        head_dim=cfg.head_dim,
-        seq_len=s,
-        batch_size=B,
-        has_bias=cfg.attention_bias,
-        dtype=dtype,
-    )
-    layer.children.append(qkv)
+    # --- QKV projections / MLA projections / Attention --------------------
+    if cfg.use_mla:
+        # MLA projection: kv_a, kv_b (absorbed), q_a/q_b, o_proj
+        mla_proj = mla_proj_stats(
+            hidden_size=h,
+            num_q_heads=cfg.num_attention_heads,
+            kv_lora_rank=cfg.kv_lora_rank,
+            q_lora_rank=cfg.q_lora_rank,
+            qk_nope_head_dim=cfg.qk_nope_head_dim,
+            qk_rope_head_dim=cfg.qk_rope_head_dim,
+            v_head_dim=cfg.v_head_dim,
+            seq_len=s,
+            batch_size=B,
+            has_bias=cfg.attention_bias,
+            dtype=dtype,
+        )
+        layer.children.append(mla_proj)
 
-    # --- Attention kernel ----------------------------------------------------
-    attn = attention_stats(
-        hidden_size=h,
-        num_q_heads=cfg.num_attention_heads,
-        num_kv_heads=cfg.num_key_value_heads,
-        head_dim=cfg.head_dim,
-        seq_len=s,
-        batch_size=B,
-        use_flash_attn=use_flash_attn,
-        dtype=dtype,
-    )
-    layer.children.append(attn)
+        if cfg.use_dsa:
+            # DSA: indexer branch + sparse MLA attention
+            indexer = dsa_indexer_stats(
+                hidden_size=h,
+                q_lora_rank=cfg.q_lora_rank,
+                index_n_heads=cfg.index_n_heads,
+                index_head_dim=cfg.index_head_dim,
+                seq_len=s,
+                batch_size=B,
+                dtype=dtype,
+            )
+            layer.children.append(indexer)
 
-    # --- Output projection ---------------------------------------------------
-    o_proj = output_proj_stats(
-        hidden_size=h,
-        seq_len=s,
-        batch_size=B,
-        has_bias=cfg.attention_bias,
-        dtype=dtype,
-    )
-    layer.children.append(o_proj)
+            sparse_attn = dsa_sparse_attention_stats(
+                num_q_heads=cfg.num_attention_heads,
+                kv_lora_rank=cfg.kv_lora_rank,
+                qk_rope_head_dim=cfg.qk_rope_head_dim,
+                v_head_dim=cfg.v_head_dim,
+                index_topk=cfg.index_topk,
+                seq_len=s,
+                batch_size=B,
+                dtype=dtype,
+            )
+            layer.children.append(sparse_attn)
+        else:
+            # Standard MLA attention (absorbed, no sparsity)
+            mla_attn = mla_attention_stats(
+                num_q_heads=cfg.num_attention_heads,
+                kv_lora_rank=cfg.kv_lora_rank,
+                qk_nope_head_dim=cfg.qk_nope_head_dim,
+                qk_rope_head_dim=cfg.qk_rope_head_dim,
+                v_head_dim=cfg.v_head_dim,
+                seq_len=s,
+                batch_size=B,
+                use_flash_attn=use_flash_attn,
+                dtype=dtype,
+            )
+            layer.children.append(mla_attn)
+    else:
+        # Standard QKV + Attention + O projection
+        qkv = qkv_proj_stats(
+            hidden_size=h,
+            num_q_heads=cfg.num_attention_heads,
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            seq_len=s,
+            batch_size=B,
+            has_bias=cfg.attention_bias,
+            dtype=dtype,
+        )
+        layer.children.append(qkv)
+
+        attn = attention_stats(
+            hidden_size=h,
+            num_q_heads=cfg.num_attention_heads,
+            num_kv_heads=cfg.num_key_value_heads,
+            head_dim=cfg.head_dim,
+            seq_len=s,
+            batch_size=B,
+            use_flash_attn=use_flash_attn,
+            dtype=dtype,
+        )
+        layer.children.append(attn)
+
+        o_proj = output_proj_stats(
+            hidden_size=h,
+            seq_len=s,
+            batch_size=B,
+            has_bias=cfg.attention_bias,
+            dtype=dtype,
+        )
+        layer.children.append(o_proj)
 
     # --- Post-attention norm -------------------------------------------------
     post_attn_norm = _norm_stats(h, cfg.norm_type, s, B, dtype)
@@ -185,6 +243,7 @@ class ModelStats:
     all_layers: ComputeStats = field(default_factory=lambda: ComputeStats("All Layers"))
     lm_head: ComputeStats = field(default_factory=lambda: ComputeStats("LM Head"))
     layer_breakdown: List[ComputeStats] = field(default_factory=list)
+    kv_cache: Optional[KVCacheStats] = None
 
 
 def model_stats(
@@ -193,6 +252,7 @@ def model_stats(
     batch_size: int = 1,
     dtype: DType = DType.BF16,
     use_flash_attn: bool = False,
+    kv_hit_ratio: float = 0.0,
 ) -> ModelStats:
     """Compute full-model statistics.
 
@@ -285,6 +345,25 @@ def model_stats(
         act_bytes=one_layer.act_bytes,    # peak per-layer activation
         hbm_read_bytes=total_hbm_r,
         hbm_write_bytes=total_hbm_w,
+    )
+
+    # --- KV Cache analysis --------------------------------------------------
+    result.kv_cache = kv_cache_stats(
+        hidden_size=h,
+        num_q_heads=cfg.num_attention_heads,
+        num_kv_heads=cfg.num_key_value_heads,
+        head_dim=cfg.head_dim,
+        num_layers=N,
+        seq_len=s,
+        batch_size=B,
+        dtype=dtype,
+        use_mla=cfg.use_mla,
+        kv_lora_rank=cfg.kv_lora_rank,
+        qk_rope_head_dim=cfg.qk_rope_head_dim,
+        v_head_dim=cfg.v_head_dim,
+        use_dsa=cfg.use_dsa,
+        index_head_dim=cfg.index_head_dim,
+        hit_ratio=kv_hit_ratio,
     )
 
     return result

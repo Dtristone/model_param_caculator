@@ -6,9 +6,10 @@ Parse a HuggingFace model config.json into a normalised ModelConfig dataclass.
 Supported architectures
 -----------------------
 - Qwen / Qwen2 / Qwen2.5  (qwen2)
-- ChatGLM / GLM-4           (chatglm)
+- ChatGLM / GLM-4 / GLM-5  (chatglm, glm5)
 - LLaMA / LLaMA-2 / LLaMA-3 (llama)
 - Mistral / Mixtral          (mistral, mixtral)
+- DeepSeek-V2 / V3 (MLA)    (deepseek_v2)
 - Generic dense transformer  (fallback)
 """
 
@@ -62,11 +63,25 @@ class ModelConfig:
     attention_bias: bool = False
     mlp_bias: bool = False
 
+    # --- MLA (Multi-Latent Attention) fields --------------------------------
+    use_mla: bool = False              # True for DeepSeek-V2/V3, GLM-5
+    kv_lora_rank: int = 0              # KV latent compression rank (c_kv)
+    q_lora_rank: int = 0               # Q latent compression rank  (c_q)
+    qk_nope_head_dim: int = 0          # dimension of Q/K not using RoPE
+    qk_rope_head_dim: int = 0          # dimension of Q/K using RoPE
+    v_head_dim: int = 0                # value head dimension
+
+    # --- DSA (Differential Sparse Attention) fields -------------------------
+    use_dsa: bool = False              # True for GLM-5 with DSA
+    index_head_dim: int = 0            # indexer head dimension
+    index_n_heads: int = 0             # number of indexer attention heads
+    index_topk: int = 2048             # top-k tokens selected by indexer
+
     def __post_init__(self) -> None:
         # Infer head_dim if not explicitly set
         if self.num_attention_heads > 0:
             inferred = self.hidden_size // self.num_attention_heads
-            if inferred > 0:
+            if inferred > 0 and self.head_dim == 128:
                 self.head_dim = inferred
         # Default KV heads to Q heads (MHA)
         if self.num_key_value_heads <= 0:
@@ -78,8 +93,26 @@ class ModelConfig:
         return self.num_key_value_heads * self.head_dim
 
     @property
+    def mla_q_head_dim(self) -> int:
+        """Total Q/K head dim for MLA = qk_nope + qk_rope."""
+        return self.qk_nope_head_dim + self.qk_rope_head_dim
+
+    @property
+    def mla_kv_cache_per_token(self) -> int:
+        """Elements stored in KV cache per token for MLA.
+
+        MLA caches the compressed KV latent (kv_lora_rank) plus the
+        RoPE-applied key portion (qk_rope_head_dim), instead of full KV.
+        """
+        return self.kv_lora_rank + self.qk_rope_head_dim
+
+    @property
     def attention_type(self) -> str:
         """Return a human-readable attention type string."""
+        if self.use_mla:
+            if self.use_dsa:
+                return "DSA+MLA"
+            return "MLA"
         if self.num_key_value_heads == 1:
             return "MQA"
         if self.num_key_value_heads < self.num_attention_heads:
@@ -181,6 +214,24 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
     max_pos = int(_get(cfg, "max_position_embeddings", "seq_length",
                         "max_sequence_length", default=4096))
 
+    # MLA (Multi-Latent Attention) ——————————————————————————————————————
+    kv_lora_rank = int(_get(cfg, "kv_lora_rank", default=0))
+    q_lora_rank = int(_get(cfg, "q_lora_rank", default=0))
+    qk_nope_head_dim = int(_get(cfg, "qk_nope_head_dim", "qk_head_dim", default=0))
+    qk_rope_head_dim = int(_get(cfg, "qk_rope_head_dim", "qk_pos_emb_head_dim", default=0))
+    v_head_dim = int(_get(cfg, "v_head_dim", default=0))
+    use_mla = kv_lora_rank > 0
+
+    # DSA (Differential Sparse Attention) ———————————————————————————————
+    index_head_dim = int(_get(cfg, "index_head_dim", default=0))
+    index_n_heads = int(_get(cfg, "index_n_heads", "index_num_attention_heads", default=0))
+    index_topk = int(_get(cfg, "index_topk", default=2048))
+    use_dsa = index_n_heads > 0
+
+    # For MLA models, override head_dim to match the actual Q/K head dim
+    if use_mla and qk_nope_head_dim > 0:
+        head_dim = qk_nope_head_dim + qk_rope_head_dim
+
     return ModelConfig(
         name=name,
         model_type=model_type,
@@ -201,6 +252,16 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
         max_position_embeddings=max_pos,
         attention_bias=attn_bias,
         mlp_bias=mlp_bias,
+        use_mla=use_mla,
+        kv_lora_rank=kv_lora_rank,
+        q_lora_rank=q_lora_rank,
+        qk_nope_head_dim=qk_nope_head_dim,
+        qk_rope_head_dim=qk_rope_head_dim,
+        v_head_dim=v_head_dim,
+        use_dsa=use_dsa,
+        index_head_dim=index_head_dim,
+        index_n_heads=index_n_heads,
+        index_topk=index_topk,
     )
 
 
