@@ -182,7 +182,8 @@ def visualize(cfg: ModelConfig, use_flash_attn: bool = False) -> str:
         lines.append(_inner_line(content, W))
 
     attn_mode = "flash attn" if use_flash_attn else "std attn"
-    attn_row = f"── Attention ({attn_type}, {attn_mode}) " + "─" * max(0, inner_w - 26 - len(attn_type) - len(attn_mode))
+    prefix = f"── Attention ({attn_type}, {attn_mode}) "
+    attn_row = prefix + "─" * max(0, inner_w - len(prefix))
     lines.append(_inner_line(attn_row, W))
 
     o_row = f"O proj    [{cfg.hidden_size} → {cfg.hidden_size}]"
