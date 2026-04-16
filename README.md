@@ -158,7 +158,7 @@ For `Y = X W^T` with `X ∈ R^(B·s × in)` and `W ∈ R^(out × in)`:
 
 - **Parameters**: `in · out`
 - **FLOPs**: `2 · B · s · in · out`
-- **HBM read**: `B · s · in + in · out`
+- **HBM read**: `B · s · in + in · out (+ out if bias)`
 - **HBM write**: `B · s · out`
 
 ### 2. Standard MHA / GQA / MQA attention
@@ -187,6 +187,7 @@ Total:
   - read `Q, K, V`
   - write output
   - no materialized `s × s` matrix
+  - working-set statistics are two per-row buffers (`m`, `l`)
 
 ### 3. MLA (absorbed inference path)
 
@@ -303,6 +304,12 @@ Key correction:
 #### MLA
 
 - **total** = `c_kv + d_r`
+
+For MLA compression ratio, the reference dense MHA cache uses the model's
+standard head width:
+
+- `d_std = hidden_size / num_attention_heads`
+- reference MHA cache / token / layer = `2 · a · d_std`
 
 #### DSA + MLA
 

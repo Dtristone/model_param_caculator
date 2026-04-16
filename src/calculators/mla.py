@@ -196,7 +196,7 @@ def mla_attention_stats(
     if use_flash_attn:
         hbm_read = int((q_elems + kv_cache_elems) * eb)
         hbm_write = int(latent_out_elems * eb)
-        act_bytes = int(B * a * s * eb)
+        act_bytes = int(2 * B * a * s * eb)
         label = "MLA Flash Attention (absorbed)"
     else:
         attn_matrix = int(B * a * s * s * eb)

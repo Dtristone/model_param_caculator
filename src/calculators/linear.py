@@ -58,7 +58,8 @@ class LinearStats:
 
         # HBM traffic
         tokens = B * s
-        hbm_read = int((tokens * in_f + in_f * out_f) * eb)
+        param_elems = n_params  # weights plus bias when present
+        hbm_read = int((tokens * in_f + param_elems) * eb)
         hbm_write = int(tokens * out_f * eb)
 
         # Activation memory (input + output tensors)

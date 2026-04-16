@@ -99,8 +99,8 @@ def attention_stats(
         # Flash Attention: attention matrix never written to HBM
         hbm_read = hbm_read_qkv
         hbm_write = hbm_write_o
-        # Activation: only per-row statistics (m, l) for each head
-        act_bytes = int(B * a * s * eb)
+        # Activation: two per-row statistics buffers (m, l) for each head
+        act_bytes = int(2 * B * a * s * eb)
         label = "Flash Attention"
     else:
         # Standard Attention: write then read back attention matrix

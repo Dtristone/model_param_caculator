@@ -47,9 +47,17 @@ from typing import Optional
 
 from .base import ComputeStats, DType, dtype_bytes
 
+DEFAULT_HEAD_DIM = 128
+
 def _mla_kv_cache_flops_per_token(hidden_size: int, kv_lora_rank: int, qk_rope_head_dim: int) -> int:
     """FLOPs per token to produce the MLA cache via kv_a_proj."""
     return 2 * hidden_size * (kv_lora_rank + qk_rope_head_dim)
+
+
+def _standard_mha_head_dim(hidden_size: int, num_q_heads: int, fallback_head_dim: int) -> int:
+    """Reference per-head width for the equivalent standard MHA cache."""
+    inferred = hidden_size // num_q_heads if num_q_heads > 0 else 0
+    return inferred if inferred > 0 else fallback_head_dim
 
 
 @dataclass
@@ -129,9 +137,14 @@ def kv_cache_stats(
         total_per_token += idx_per_token
         attn_type = "DSA+MLA" if use_dsa else "MLA"
 
-        # Reference: standard MHA cache for same model
-        # MHA equivalent: 2 * num_q_heads * head_dim_equivalent
-        mha_equiv = 2 * num_q_heads * (head_dim if head_dim > 0 else 128)
+        # Reference: standard MHA cache for the same hidden size.
+        # Use hidden_size / num_q_heads instead of MLA's expanded Q/K head dim.
+        standard_mha_head_dim = _standard_mha_head_dim(
+            hidden_size,
+            num_q_heads,
+            head_dim if head_dim > 0 else DEFAULT_HEAD_DIM,
+        )
+        mha_equiv = 2 * num_q_heads * standard_mha_head_dim
     else:
         # Standard GQA/MHA/MQA
         k_per_token = num_kv_heads * head_dim

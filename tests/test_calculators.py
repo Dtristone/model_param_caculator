@@ -85,6 +85,12 @@ class TestLinearStats:
         expected_reads = int((B * s * in_f + in_f * out_f) * 2)
         assert stat.hbm_read_bytes == expected_reads
 
+    def test_hbm_read_includes_bias_when_present(self):
+        in_f, out_f, s, B = 128, 256, 4, 1
+        stat = LinearStats("t", in_f, out_f, has_bias=True, seq_len=s, batch_size=B, dtype=DType.BF16).compute()
+        expected_reads = int((B * s * in_f + in_f * out_f + out_f) * 2)
+        assert stat.hbm_read_bytes == expected_reads
+
     def test_hbm_write_is_output(self):
         in_f, out_f, s, B = 128, 256, 4, 1
         stat = LinearStats("t", in_f, out_f, seq_len=s, batch_size=B, dtype=DType.BF16).compute()
@@ -172,6 +178,14 @@ class TestAttentionStats:
         std   = attention_stats(h, a, k, d, s, use_flash_attn=False)
         flash = attention_stats(h, a, k, d, s, use_flash_attn=True)
         assert flash.act_bytes < std.act_bytes
+
+    def test_flash_activation_memory_tracks_two_online_stats(self):
+        """Flash attention keeps two per-row statistics buffers."""
+        h, a, k, d, s, B = 512, 8, 8, 64, 256, 1
+        flash = attention_stats(h, a, k, d, s, B, use_flash_attn=True, dtype=DType.BF16)
+        num_online_stats_buffers = 2
+        eb = 2
+        assert flash.act_bytes == num_online_stats_buffers * B * a * s * eb
 
     def test_standard_attn_has_attn_matrix_in_hbm(self):
         """Standard attention must read/write the attention matrix (B*a*s²)."""
@@ -660,6 +674,18 @@ class TestMLAStats:
         flash = mla_attention_stats(**kwargs, use_flash_attn=True)
         assert flash.hbm_total_bytes < std.hbm_total_bytes
 
+    def test_mla_flash_activation_memory_tracks_two_online_stats(self):
+        """Flash MLA also keeps two per-row statistics buffers."""
+        flash = mla_attention_stats(
+            num_q_heads=16, kv_lora_rank=512,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, seq_len=64, batch_size=1,
+            use_flash_attn=True, dtype=DType.BF16,
+        )
+        num_online_stats_buffers = 2
+        eb = 2
+        assert flash.act_bytes == num_online_stats_buffers * 1 * 16 * 64 * eb
+
     def test_mla_no_learnable_params(self):
         """Attention kernel itself has no learnable params."""
         attn = mla_attention_stats(
@@ -797,13 +823,17 @@ class TestKVCache:
 
     def test_mla_compression_ratio(self):
         """MLA should have high compression ratio vs standard MHA."""
+        num_q_heads = 16
+        standard_head_dim = 2048 // num_q_heads
+        kv_lora_rank = 512
+        qk_rope_head_dim = 64
         kv = kv_cache_stats(
-            hidden_size=2048, num_q_heads=16, num_kv_heads=16,
+            hidden_size=2048, num_q_heads=num_q_heads, num_kv_heads=16,
             head_dim=192, num_layers=27, seq_len=2048,
-            use_mla=True, kv_lora_rank=512, qk_rope_head_dim=64,
+            use_mla=True, kv_lora_rank=kv_lora_rank, qk_rope_head_dim=qk_rope_head_dim,
             v_head_dim=128,
         )
-        assert kv.compression_ratio > 5.0  # significant compression
+        assert kv.compression_ratio == (2 * num_q_heads * standard_head_dim) / (kv_lora_rank + qk_rope_head_dim)
 
     def test_dsa_mla_includes_indexer(self):
         """DSA+MLA should include indexer K cache in total."""
@@ -874,6 +904,7 @@ class TestConfigParserMLA:
         """DeepSeek-V2-Lite should be parsed as MLA model."""
         cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json", name="DS-V2-Lite")
         assert cfg.use_mla is True
+        assert cfg.head_dim == 128
         assert cfg.kv_lora_rank == 512
         assert cfg.q_lora_rank == 1536
         assert cfg.qk_nope_head_dim == 128

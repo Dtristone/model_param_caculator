@@ -229,10 +229,6 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
     index_topk = int(_get(cfg, "index_topk", default=2048))
     use_dsa = index_n_heads > 0
 
-    # For MLA models, override head_dim to match the actual Q/K head dim
-    if use_mla and qk_nope_head_dim > 0:
-        head_dim = qk_nope_head_dim + qk_rope_head_dim
-
     return ModelConfig(
         name=name,
         model_type=model_type,
