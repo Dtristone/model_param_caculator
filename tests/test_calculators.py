@@ -554,27 +554,27 @@ class TestMLAStats:
     """Tests for Multi-Latent Attention calculator."""
 
     def test_mla_proj_has_correct_children(self):
-        """MLA proj with q_lora_rank should have: kv_a, kv_b, q_a, q_b, o_proj."""
+        """Absorbed MLA proj includes kv_a, kv_b weights, q_a, q_b, q_absorb, v_expand, o_proj."""
         s = mla_proj_stats(
             hidden_size=2048, num_q_heads=16,
             kv_lora_rank=512, q_lora_rank=1536,
             qk_nope_head_dim=128, qk_rope_head_dim=64,
             v_head_dim=128, seq_len=8, batch_size=1,
         )
-        assert len(s.children) == 5  # kv_a, kv_b, q_a, q_b, o_proj
+        assert len(s.children) == 7
 
     def test_mla_proj_without_q_lora(self):
-        """When q_lora_rank=0, should have: kv_a, kv_b, q_direct, o_proj."""
+        """Without q_lora, absorbed MLA keeps kv_a, kv_b weights, q_direct, q_absorb, v_expand, o_proj."""
         s = mla_proj_stats(
             hidden_size=2048, num_q_heads=16,
             kv_lora_rank=512, q_lora_rank=0,
             qk_nope_head_dim=128, qk_rope_head_dim=64,
             v_head_dim=128, seq_len=8, batch_size=1,
         )
-        assert len(s.children) == 4  # kv_a, kv_b, q_direct, o_proj
+        assert len(s.children) == 6
 
     def test_kv_b_proj_has_zero_flops(self):
-        """kv_b_proj is absorbed at inference → 0 FLOPs."""
+        """Stored kv_b weight tensor has 0 direct FLOPs."""
         s = mla_proj_stats(
             hidden_size=2048, num_q_heads=16,
             kv_lora_rank=512, q_lora_rank=1536,
@@ -585,6 +585,17 @@ class TestMLAStats:
         assert kv_b.flops == 0
         assert kv_b.num_params > 0  # still has parameters
         assert kv_b.weight_bytes > 0
+
+    def test_q_absorb_and_v_expand_have_flops(self):
+        """Absorbed path pays runtime cost in q_absorb and v_expand."""
+        s = mla_proj_stats(
+            hidden_size=2048, num_q_heads=16,
+            kv_lora_rank=512, q_lora_rank=1536,
+            qk_nope_head_dim=128, qk_rope_head_dim=64,
+            v_head_dim=128, seq_len=8, batch_size=1,
+        )
+        assert s.children[4].flops > 0  # q_absorb
+        assert s.children[5].flops > 0  # v_expand
 
     def test_kv_b_params_count(self):
         """kv_b params = c_kv × a × (d_n + v_dim)."""
@@ -673,6 +684,7 @@ class TestDSAStats:
         s = dsa_indexer_stats(
             hidden_size=4096, q_lora_rank=1536,
             index_n_heads=8, index_head_dim=128,
+            index_topk=2048,
             seq_len=32, batch_size=1,
         )
         assert len(s.children) == 5
@@ -692,6 +704,7 @@ class TestDSAStats:
         s = dsa_indexer_stats(
             hidden_size=h, q_lora_rank=c_q,
             index_n_heads=idx_a, index_head_dim=idx_h,
+            index_topk=2048,
             seq_len=32, batch_size=1,
         )
         assert s.num_params == expected_params
@@ -998,4 +1011,3 @@ class TestVisualizerMLA:
         assert "K proj" in diagram
         assert "GQA" in diagram
         assert "KV cache/token" in diagram
-

@@ -33,13 +33,11 @@ parameter models this:
   - hit_ratio = 0.5: 50% of tokens have cached KVs (only need to read, not compute)
   - hit_ratio = 1.0: entire KV cache is pre-filled (decode-only scenario)
 
-Effect on memory access:
-  Cached tokens: only HBM reads (no projection FLOPs, no HBM writes for KV)
-  New tokens: full projection FLOPs + HBM writes for KV
-
-Effect on computation:
-  KV projection FLOPs scale as (1 - hit_ratio) × original_flops
-  Attention FLOPs remain the same (still attend to all s tokens)
+Assumption:
+  The hit ratio here models *cache-producing paths only* (K/V cache writes and
+  the projections needed to produce them). It does not try to model a full
+  prefix-cached end-to-end forward where all non-cache module work for cached
+  prefix tokens is skipped.
 """
 
 from __future__ import annotations
@@ -48,6 +46,10 @@ from dataclasses import dataclass
 from typing import Optional
 
 from .base import ComputeStats, DType, dtype_bytes
+
+def _mla_kv_cache_flops_per_token(hidden_size: int, kv_lora_rank: int, qk_rope_head_dim: int) -> int:
+    """FLOPs per token to produce the MLA cache via kv_a_proj."""
+    return 2 * hidden_size * (kv_lora_rank + qk_rope_head_dim)
 
 
 @dataclass
@@ -116,6 +118,7 @@ def kv_cache_stats(
     """
     eb = dtype_bytes(dtype)
     B = batch_size
+    hit_ratio = min(max(hit_ratio, 0.0), 1.0)
 
     if use_mla:
         # MLA: cache compressed latent + RoPE key
@@ -154,11 +157,18 @@ def kv_cache_stats(
     cached_tokens = int(seq_len * hit_ratio)
     new_tokens = seq_len - cached_tokens
 
-    # FLOPs saved: KV projection for cached tokens is skipped
-    # For MLA: kv_a_proj FLOPs = 2 * h * (c_kv + d_r) per token
-    # For GQA: K+V proj FLOPs = 2 * 2 * h * kv_heads * head_dim per token
+    # FLOPs saved: cache-producing paths only.
+    # MLA: kv_a_proj only.
+    # DSA+MLA: kv_a_proj + indexer wk (K cache for indexer).
+    # GQA/MHA/MQA: K+V projections.
     if use_mla:
-        kv_proj_flops_per_token = 2 * hidden_size * (kv_lora_rank + qk_rope_head_dim)
+        kv_proj_flops_per_token = _mla_kv_cache_flops_per_token(
+            hidden_size=hidden_size,
+            kv_lora_rank=kv_lora_rank,
+            qk_rope_head_dim=qk_rope_head_dim,
+        )
+        if use_dsa:
+            kv_proj_flops_per_token += 2 * hidden_size * index_head_dim
     else:
         kv_proj_flops_per_token = 2 * 2 * hidden_size * num_kv_heads * head_dim
 

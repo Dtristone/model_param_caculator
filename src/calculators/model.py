@@ -122,6 +122,7 @@ def _transformer_layer_stats(
                 q_lora_rank=cfg.q_lora_rank,
                 index_n_heads=cfg.index_n_heads,
                 index_head_dim=cfg.index_head_dim,
+                index_topk=cfg.index_topk,
                 seq_len=s,
                 batch_size=B,
                 dtype=dtype,
@@ -280,7 +281,7 @@ def model_stats(
         flops=0,          # look-up, not multiply-add
         weight_bytes=emb_w,
         act_bytes=int(B * s * h * eb),
-        hbm_read_bytes=int(B * s * eb + emb_w),  # indices + embedding table
+        hbm_read_bytes=int(B * s * eb + B * s * h * eb),  # indices + accessed rows
         hbm_write_bytes=int(B * s * h * eb),
     )
 
@@ -294,7 +295,7 @@ def model_stats(
         num_params=one_layer.num_params * N,
         flops=one_layer.flops * N,
         weight_bytes=one_layer.weight_bytes * N,
-        act_bytes=one_layer.act_bytes * N,
+        act_bytes=one_layer.act_bytes,
         hbm_read_bytes=one_layer.hbm_read_bytes * N,
         hbm_write_bytes=one_layer.hbm_write_bytes * N,
     )
@@ -342,7 +343,7 @@ def model_stats(
         num_params=total_params,
         flops=total_flops,
         weight_bytes=total_w,
-        act_bytes=one_layer.act_bytes,    # peak per-layer activation
+        act_bytes=max(result.embedding.act_bytes, one_layer.act_bytes, result.lm_head.act_bytes),
         hbm_read_bytes=total_hbm_r,
         hbm_write_bytes=total_hbm_w,
     )
