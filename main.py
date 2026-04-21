@@ -47,7 +47,25 @@ def parse_args(argv=None) -> argparse.Namespace:
         "--seq-len", "-s",
         type=int,
         default=2048,
-        help="Sequence length (default: 2048).",
+        help="Default query/KV/cache length when explicit lengths are not provided (default: 2048).",
+    )
+    parser.add_argument(
+        "--q-len",
+        type=int,
+        default=None,
+        help="Query length / number of newly computed tokens (defaults to --seq-len).",
+    )
+    parser.add_argument(
+        "--kv-len",
+        type=int,
+        default=None,
+        help="Key/value length seen by attention (defaults to --seq-len).",
+    )
+    parser.add_argument(
+        "--cache-len",
+        type=int,
+        default=None,
+        help="Total KV cache length to size cache storage (defaults to --kv-len).",
     )
     parser.add_argument(
         "--batch-size", "-b",
@@ -85,6 +103,18 @@ def parse_args(argv=None) -> argparse.Namespace:
         default=0.0,
         help="KV cache hit ratio (0.0-1.0) for cache reuse analysis (default: 0.0).",
     )
+    parser.add_argument(
+        "--cache-layout",
+        choices=["standard", "mla_compressed", "mla_expanded"],
+        default=None,
+        help="Override cache layout used for KV cache reporting.",
+    )
+    parser.add_argument(
+        "--dsa-indexer-mode",
+        choices=["fused_topk", "eager_dense_scores"],
+        default=None,
+        help="Override DSA indexer memory mode.",
+    )
     return parser.parse_args(argv)
 
 
@@ -98,6 +128,10 @@ def main(argv=None) -> None:
         sys.exit(1)
 
     cfg = load_config(config_path, name=args.name)
+    if args.cache_layout is not None:
+        cfg.cache_layout = args.cache_layout
+    if args.dsa_indexer_mode is not None:
+        cfg.dsa_indexer_mode = args.dsa_indexer_mode
     dtype = DType(args.dtype)
 
     # Visualize ----------------------------------------------------------
@@ -113,6 +147,9 @@ def main(argv=None) -> None:
         dtype=dtype,
         use_flash_attn=args.flash_attn,
         kv_hit_ratio=args.kv_hit_ratio,
+        q_len=args.q_len,
+        kv_len=args.kv_len,
+        cache_len=args.cache_len,
     )
 
     # Report --------------------------------------------------------------

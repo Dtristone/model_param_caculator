@@ -30,7 +30,7 @@ Three variants are supported:
 
 from __future__ import annotations
 
-from .base import ComputeStats, DType, dtype_bytes
+from .base import ComputeStats, DType, elements_to_bytes
 from .linear import LinearStats
 
 
@@ -64,7 +64,6 @@ def ffn_stats(
     """
     B, s = batch_size, seq_len
     h, ffn_h = hidden_size, intermediate_size
-    eb = dtype_bytes(dtype)
     ffn_type = ffn_type.lower()
 
     stats = ComputeStats(name=f"FFN ({ffn_type.upper()})")
@@ -76,14 +75,18 @@ def ffn_stats(
         down = LinearStats("Down proj", ffn_h, h, has_bias, s, B, dtype).compute()
 
         # Element-wise activation + multiply (gate ⊙ act(up))
+        # FLOPs are an approximation: 1 op for act(gate) + 1 op for element-wise multiply.
+        # Exact activation cost (SiLU ≈ 4–6 ops, GELU ≈ 8–14 ops) is platform-dependent.
+        # Using 2 ops per element follows the same convention as most FLOPs estimation tools
+        # (e.g. Megatron-LM, FLOPs counters in major ML papers) and is accepted for this use case.
         act_name = "SiLU" if ffn_type == "swiglu" else "GELU"
-        ew_flops = 2 * B * s * ffn_h   # gate act + multiply
+        ew_flops = 2 * B * s * ffn_h   # approximate: act(gate) + gate*up
         ew = ComputeStats(
             name=f"{act_name} + multiply",
             flops=ew_flops,
-            hbm_read_bytes=int(2 * B * s * ffn_h * eb),   # read gate + up
-            hbm_write_bytes=int(B * s * ffn_h * eb),
-            act_bytes=int(B * s * ffn_h * eb),
+            hbm_read_bytes=elements_to_bytes(2 * B * s * ffn_h, dtype),   # read gate + up
+            hbm_write_bytes=elements_to_bytes(B * s * ffn_h, dtype),
+            act_bytes=elements_to_bytes(B * s * ffn_h, dtype),
         )
 
         stats.children = [gate, up, ew, down]
@@ -92,13 +95,15 @@ def ffn_stats(
         up   = LinearStats("Up proj",   h, ffn_h, has_bias, s, B, dtype).compute()
         down = LinearStats("Down proj", ffn_h, h, has_bias, s, B, dtype).compute()
 
+        # FLOPs are an approximation: exact GELU cost (≈8–14 ops) is
+        # platform/precision-dependent; using 1 op per element is accepted.
         act_flops = B * s * ffn_h
         act = ComputeStats(
             name="Activation",
             flops=act_flops,
-            hbm_read_bytes=int(B * s * ffn_h * eb),
-            hbm_write_bytes=int(B * s * ffn_h * eb),
-            act_bytes=int(B * s * ffn_h * eb),
+            hbm_read_bytes=elements_to_bytes(B * s * ffn_h, dtype),
+            hbm_write_bytes=elements_to_bytes(B * s * ffn_h, dtype),
+            act_bytes=elements_to_bytes(B * s * ffn_h, dtype),
         )
 
         stats.children = [up, act, down]

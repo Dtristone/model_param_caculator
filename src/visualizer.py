@@ -178,7 +178,8 @@ def visualize(cfg: ModelConfig, use_flash_attn: bool = False) -> str:
         a = cfg.num_attention_heads
 
         lines.append(_inner_line(f"KV down-proj [{cfg.hidden_size} → {c_kv + d_r}]  (c_kv+d_r)", W))
-        kv_b_desc = f"KV up-proj   [{c_kv} → {a}×({d_n}+{v_dim})]  (absorbed)"
+        kv_proj_mode = "expanded cache" if cfg.cache_layout == "mla_expanded" else "absorbed"
+        kv_b_desc = f"KV up-proj   [{c_kv} → {a}×({d_n}+{v_dim})]  ({kv_proj_mode})"
         lines.append(_inner_line(kv_b_desc, W))
         if c_q > 0:
             lines.append(_inner_line(f"Q down-proj  [{cfg.hidden_size} → {c_q}]", W))
@@ -188,22 +189,30 @@ def visualize(cfg: ModelConfig, use_flash_attn: bool = False) -> str:
 
         if cfg.use_dsa:
             attn_mode = f"DSA top-{cfg.index_topk}"
-            prefix = f"── DSA+MLA Attention ({attn_mode}) "
+            runtime_mode = "expanded" if cfg.cache_layout == "mla_expanded" else "absorbed"
+            prefix = f"── DSA+MLA Attention ({runtime_mode}, {attn_mode}) "
             lines.append(_inner_line(prefix + "─" * max(0, inner_w - len(prefix)), W))
             idx_desc = f"Indexer: {cfg.index_n_heads}h×{cfg.index_head_dim}d"
             lines.append(_inner_line(idx_desc, W))
         else:
             attn_mode = "flash" if use_flash_attn else "std"
-            prefix = f"── MLA Attention (absorbed, {attn_mode}) "
+            runtime_mode = "expanded" if cfg.cache_layout == "mla_expanded" else "absorbed"
+            prefix = f"── MLA Attention ({runtime_mode}, {attn_mode}) "
             lines.append(_inner_line(prefix + "─" * max(0, inner_w - len(prefix)), W))
 
         lines.append(_inner_line(f"O proj       [{a}×{v_dim} → {cfg.hidden_size}]", W))
 
         # KV cache info
-        kv_info = f"KV cache/token: {c_kv + d_r}"
-        if cfg.use_dsa:
-            kv_info += f" + {cfg.index_head_dim} (indexer)"
-        kv_info += " elements"
+        if cfg.cache_layout == "mla_expanded":
+            kv_info = f"KV cache/token: {cfg.mla_kv_cache_per_token}"
+            if cfg.use_dsa:
+                kv_info += f" + {cfg.index_head_dim} (indexer)"
+            kv_info += " elements [expanded]"
+        else:
+            kv_info = f"KV cache/token: {c_kv + d_r}"
+            if cfg.use_dsa:
+                kv_info += f" + {cfg.index_head_dim} (indexer)"
+            kv_info += " elements [compressed]"
         lines.append(_inner_line(kv_info, W))
     else:
         q_out = cfg.num_attention_heads * cfg.head_dim
@@ -224,7 +233,7 @@ def visualize(cfg: ModelConfig, use_flash_attn: bool = False) -> str:
         attn_row = prefix + "─" * max(0, inner_w - len(prefix))
         lines.append(_inner_line(attn_row, W))
 
-        o_row = f"O proj    [{cfg.hidden_size} → {cfg.hidden_size}]"
+        o_row = f"O proj    [{q_out} → {cfg.hidden_size}]"
         lines.append(_inner_line(o_row, W))
 
         # KV cache info for standard attention
@@ -241,10 +250,19 @@ def visualize(cfg: ModelConfig, use_flash_attn: bool = False) -> str:
     # FFN
     if cfg.is_moe and cfg.num_experts > 1:
         expert_inter = cfg.moe_intermediate_size if cfg.moe_intermediate_size > 0 else cfg.intermediate_size
+        if cfg.first_k_dense_replace > 0:
+            dense_prefix = f"Dense prefix: first {cfg.first_k_dense_replace} layers"
+            lines.append(_inner_line(dense_prefix, W))
         lines.append(_inner_line(f"Router  [{cfg.hidden_size} → {cfg.num_experts} experts]", W))
         lines.append(_inner_line(
             f"Expert FFN × {cfg.num_experts_per_tok}/{cfg.num_experts} (top-K)  "
             f"[{cfg.hidden_size} → {expert_inter} → {cfg.hidden_size}]  {cfg.ffn_type.upper()}", W))
+        if cfg.num_shared_experts > 0:
+            lines.append(_inner_line(
+                f"Shared Expert × {cfg.num_shared_experts}  "
+                f"[{cfg.hidden_size} → {expert_inter * cfg.num_shared_experts} → {cfg.hidden_size}]",
+                W,
+            ))
     else:
         gate_row = f"Gate proj [{cfg.hidden_size} → {cfg.intermediate_size}]"
         up_row   = f"Up   proj [{cfg.hidden_size} → {cfg.intermediate_size}]"

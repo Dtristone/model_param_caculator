@@ -34,23 +34,20 @@ No PyTorch or HuggingFace Transformers installation required.
 ## Quick Start
 
 ```bash
-# Analyse Qwen2-7B
-python main.py --config configs/qwen2_7b.json --seq-len 2048
+# Analyse GLM-4.7
+python main.py --config configs/config_glm4.7.json --seq-len 4096
 
-# Analyse GLM-4-9B with Flash Attention
-python main.py --config configs/glm4_9b.json --seq-len 4096 --flash-attn
+# Analyse GLM-5 (DSA + MLA attention)
+python main.py --config configs/config_glm5.json --seq-len 4096
 
-# Analyse Mixtral-8x7B MoE
-python main.py --config configs/mixtral_8x7b.json --seq-len 1024 --flash-attn
+# Analyse DeepSeek-V3.2-style config
+python main.py --config configs/deepseekV32.json --seq-len 2048
 
-# Analyse DeepSeek-V2-Lite (MLA attention)
-python main.py --config configs/deepseek_v2_lite.json --seq-len 2048
-
-# Analyse GLM-5-9B (DSA + MLA attention)
-python main.py --config configs/glm5_9b.json --seq-len 4096
+# Decode-style attention lengths
+python main.py --config configs/config_glm5.json --q-len 1 --kv-len 32768 --cache-len 32768
 
 # KV cache analysis with 50% hit ratio
-python main.py --config configs/qwen2_7b.json --seq-len 2048 --kv-hit-ratio 0.5
+python main.py --config configs/config_glm5.json --seq-len 2048 --kv-hit-ratio 0.5
 
 # Use your own HuggingFace config
 python main.py --config /path/to/config.json --seq-len 2048 --dtype bf16
@@ -61,11 +58,16 @@ python main.py --config /path/to/config.json --seq-len 2048 --dtype bf16
 | Option | Default | Description |
 |---|---|---|
 | `--config` / `-c` | required | Path to HuggingFace `config.json` |
-| `--seq-len` / `-s` | `2048` | Sequence length |
+| `--seq-len` / `-s` | `2048` | Default query/KV/cache length |
+| `--q-len` | `--seq-len` | Query length / newly computed tokens |
+| `--kv-len` | `--seq-len` | KV length seen by attention |
+| `--cache-len` | `--kv-len` | Cache length used for KV cache sizing |
 | `--batch-size` / `-b` | `1` | Batch size |
 | `--dtype` / `-d` | `bf16` | `fp32 / fp16 / bf16 / int8 / int4` |
 | `--flash-attn` | off | Use Flash Attention HBM model |
 | `--kv-hit-ratio` | `0.0` | KV cache hit ratio (0.0-1.0) for cache reuse analysis |
+| `--cache-layout` | config-dependent | Override `standard / mla_compressed / mla_expanded` |
+| `--dsa-indexer-mode` | config-dependent | Override `fused_topk / eager_dense_scores` |
 | `--no-diagram` | off | Skip ASCII architecture diagram |
 | `--plain` | off | Plain text output (no rich) |
 
@@ -90,16 +92,14 @@ model_param_caculator/
 │   ├── visualizer.py        # ASCII diagram
 │   └── report.py            # Rich table report
 ├── configs/
-│   ├── qwen2_7b.json        # Qwen2-7B config
-│   ├── glm4_9b.json         # GLM-4-9B config
-│   ├── glm5_9b.json         # GLM-5-9B (DSA+MLA) config
-│   ├── deepseek_v2_lite.json # DeepSeek-V2-Lite (MLA) config
-│   └── mixtral_8x7b.json    # Mixtral-8x7B MoE config
+│   ├── config_glm4.7.json   # GLM-4.7 config
+│   ├── config_glm5.json     # GLM-5 (DSA+MLA) config
+│   └── deepseekV32.json     # DeepSeek-V3.2-style config
 ├── examples/
 │   ├── example_qwen.py
 │   └── example_glm.py
 └── tests/
-    └── test_calculators.py  # 98 unit tests
+    └── test_calculators.py  # unit tests
 ```
 
 ## Mathematical Foundations
@@ -163,22 +163,27 @@ For `Y = X W^T` with `X ∈ R^(B·s × in)` and `W ∈ R^(out × in)`:
 
 ### 2. Standard MHA / GQA / MQA attention
 
+Let:
+
+- `Q = q_len`
+- `T = kv_len`
+
 #### Projections
 
-- `Q`: `2 · B · s · h · h`
-- `K`: `2 · B · s · h · (k · d)`
-- `V`: `2 · B · s · h · (k · d)`
-- `O`: `2 · B · s · h · h`
+- `Q`: `2 · B · Q · h · (a · d)`
+- `K`: `2 · B · Q · h · (k · d)`
+- `V`: `2 · B · Q · h · (k · d)`
+- `O`: `2 · B · Q · (a · d) · h`
 
 #### Attention kernel
 
-- `QK^T`: `2 · B · a · s² · d = 2 · B · s² · h`
-- `softmax`: `5 · B · a · s²`
-- `AV`: `2 · B · a · s² · d = 2 · B · s² · h`
+- `QK^T`: `2 · B · a · Q · T · d`
+- `softmax`: `5 · B · a · Q · T`
+- `AV`: `2 · B · a · Q · T · d`
 
 Total:
 
-- **Attention FLOPs**: `2 · B · s² · h + 5 · B · a · s² + 2 · B · s² · h`
+- **Attention FLOPs**: `2 · B · a · Q · T · d + 5 · B · a · Q · T + 2 · B · a · Q · T · d`
 - **Standard-attention HBM**:
   - read `Q, K, V`
   - write/read attention matrix `A`
@@ -189,10 +194,12 @@ Total:
   - no materialized `s × s` matrix
   - working-set statistics are two per-row buffers (`m`, `l`)
 
-### 3. MLA (absorbed inference path)
+### 3. MLA runtime modes
 
-The reviewed code now models the **absorbed MLA runtime path**, which matches
-the GLM-5 implementation and optimized MLA inference.
+The calculator supports two runtime/cache layouts:
+
+- `mla_compressed`: absorbed MLA path with compressed KV cache
+- `mla_expanded`: expanded per-head K/V cache path used by current HF GLM-5 / GLM-4.7 style runtimes
 
 #### MLA cache shape per token
 
@@ -201,9 +208,13 @@ Instead of caching full `K` and `V`, MLA caches:
 - compressed KV latent: `c_kv`
 - RoPE key part: `d_r`
 
-So:
+So in compressed mode:
 
 - **MLA KV cache / token / layer** = `c_kv + d_r`
+
+In expanded mode:
+
+- **MLA KV cache / token / layer** = `a · qk_head_dim + a · v_dim`
 
 This is why MLA can be much smaller than standard MHA cache.
 
@@ -214,9 +225,11 @@ Runtime operations:
 - `kv_a_proj`: `h → (c_kv + d_r)`
 - `q_a_proj`: `h → c_q` (optional)
 - `q_b_proj`: `c_q → a · (d_n + d_r)` (or direct `h → a · (d_n + d_r)`)
-- `q_absorb`: `q_nope × W_kc`
-- `v_expand`: `latent_out × W_vc`
+- `q_absorb`: `q_nope × W_kc`  (compressed mode)
+- `v_expand`: `latent_out × W_vc`  (compressed mode)
 - `o_proj`: `a · v → h`
+- `kv_a_layernorm`: latent RMSNorm on the compressed KV branch
+- `q_a_layernorm`: latent RMSNorm on the Q LoRA branch when present
 
 FLOPs:
 
@@ -230,27 +243,34 @@ FLOPs:
 Important note:
 
 - the `kv_b_proj` **weights still exist as parameters**
-- but in the absorbed path there is **no explicit** `kv_b_proj(hidden)` activation matmul
-- instead, its weight is consumed through `W_kc` and `W_vc`
+- in compressed mode there is **no explicit** full `kv_b_proj(hidden)` cache materialization
+- in expanded mode the runtime writes expanded per-head K/V cache instead of staying in latent space
 
 #### MLA attention kernel
 
-Attention runs in compressed space:
+Compressed mode runs in latent space:
 
 - `QK^T` dimension = `c_kv + d_r`
 - `AV` latent dimension = `c_kv`
 
 FLOPs:
 
-- `QK^T`: `2 · B · a · s² · (c_kv + d_r)`
-- `softmax`: `5 · B · a · s²`
-- `AV`: `2 · B · a · s² · c_kv`
+- `QK^T`: `2 · B · a · Q · T · (c_kv + d_r)`
+- `softmax`: `5 · B · a · Q · T`
+- `AV`: `2 · B · a · Q · T · c_kv`
 
 HBM model:
 
-- read query tensor: `B · s · a · (c_kv + d_r)`
-- read compressed KV cache once: `B · s · (c_kv + d_r)`
-- write latent attention output: `B · s · a · c_kv`
+- read query tensor: `B · Q · a · (d_n + d_r)`
+- read compressed KV cache once: `B · T · (c_kv + d_r)`
+- write latent attention output: `B · Q · a · c_kv`
+
+Expanded mode reads full per-head cache:
+
+- read `Q`: `B · Q · a · qk_head_dim`
+- read `K`: `B · T · a · qk_head_dim`
+- read `V`: `B · T · a · v_dim`
+- write output: `B · Q · a · v_dim`
 
 ### 4. DSA (GLM-5)
 
@@ -273,25 +293,32 @@ The key correction in the reviewed math is:
 
 Indexer FLOPs:
 
-- `wq_b`: `2 · B · s · c_q · (idx_heads · idx_dim)`
-- `wk`: `2 · B · s · h · idx_dim`
-- `weights_proj`: `2 · B · s · h · idx_heads`
-- `index score dot-products`: `2 · B · idx_heads · s² · idx_dim`
-- `top-k softmax`: `5 · B · s · k_sel`
+- `wq_b`: `2 · B · Q · c_q · (idx_heads · idx_dim)`
+- `wk`: `2 · B · T · h · idx_dim`
+- `weights_proj`: `2 · B · Q · h · idx_heads`
+- `index score dot-products`: `2 · B · Q · T · idx_heads · idx_dim`
+- `ReLU`: `B · Q · T · idx_heads`
+- `head-weighted reduction`: `2 · B · Q · T · idx_heads`
+- `top-k selection`: backend-dependent approximation
+
+Indexer memory mode is runtime-dependent:
+
+- `fused_topk`: keep only top-k scores / indices (`O(B · Q · k_sel)`)
+- `eager_dense_scores`: materialize dense intermediate scores (`O(B · Q · idx_heads · T)`)
 
 #### 4.2 DSA sparse MLA main branch
 
-After indexing, each query attends to only `k_sel` tokens:
+After indexing, each query attends to only `k_sel = min(index_topk, kv_len)` tokens:
 
-- `QK^T`: `2 · B · a · s · k_sel · (c_kv + d_r)`
-- `softmax`: `5 · B · a · s · k_sel`
-- `AV`: `2 · B · a · s · k_sel · c_kv`
+- `QK^T`: `2 · B · a · Q · k_sel · (...)`
+- `softmax`: `5 · B · a · Q · k_sel`
+- `AV`: `2 · B · a · Q · k_sel · (...)`
 
 Key correction:
 
 - DSA sparse HBM read for KV must scale with **gathered top-k KV access**
-- so runtime KV reads are modeled with `O(B · s · k_sel · (c_kv + d_r))`
-- not `O(B · s · (c_kv + d_r))`
+- compressed mode reads gathered latent/rope cache
+- expanded mode reads gathered full per-head K and V cache
 
 ### 5. KV cache formulas
 
@@ -316,6 +343,16 @@ standard head width:
 - MLA cache: `c_kv + d_r`
 - extra DSA indexer K cache: `index_head_dim`
 - **total** = `c_kv + d_r + index_head_dim`
+
+Expanded DSA + MLA cache:
+
+- `a · qk_head_dim + a · v_dim + index_head_dim`
+
+### 6. Decode lengths and MTP exclusion
+
+- attention-like paths use `q_len` for newly computed query tokens and `kv_len` for attended context length
+- cache sizing uses `cache_len`
+- when `num_nextn_predict_layers > 0`, totals currently **exclude** next-n prediction / MTP blocks and the report labels that explicitly
 
 ### 6. KV hit ratio assumption
 

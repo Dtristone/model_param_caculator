@@ -55,6 +55,9 @@ class ModelConfig:
     num_experts: int = 0               # Total number of experts E
     num_experts_per_tok: int = 0       # Top-K activated experts K
     moe_intermediate_size: int = 0     # Expert FFN intermediate size (if differs)
+    num_shared_experts: int = 0        # Always-on shared experts
+    first_k_dense_replace: int = 0     # First K layers use dense MLP instead of MoE
+    mlp_layer_types: Optional[list[str]] = None
 
     # Positional encoding
     max_position_embeddings: int = 4096
@@ -62,11 +65,14 @@ class ModelConfig:
     # Biases
     attention_bias: bool = False
     mlp_bias: bool = False
+    use_qk_norm: bool = False
+    num_nextn_predict_layers: int = 0
 
     # --- MLA (Multi-Latent Attention) fields --------------------------------
     use_mla: bool = False              # True for DeepSeek-V2/V3, GLM-5
     kv_lora_rank: int = 0              # KV latent compression rank (c_kv)
     q_lora_rank: int = 0               # Q latent compression rank  (c_q)
+    qk_head_dim: int = 0               # total Q/K head dim
     qk_nope_head_dim: int = 0          # dimension of Q/K not using RoPE
     qk_rope_head_dim: int = 0          # dimension of Q/K using RoPE
     v_head_dim: int = 0                # value head dimension
@@ -76,6 +82,8 @@ class ModelConfig:
     index_head_dim: int = 0            # indexer head dimension
     index_n_heads: int = 0             # number of indexer attention heads
     index_topk: int = 2048             # top-k tokens selected by indexer
+    cache_layout: str = "standard"     # standard | mla_compressed | mla_expanded
+    dsa_indexer_mode: str = "fused_topk"  # fused_topk | eager_dense_scores
 
     def __post_init__(self) -> None:
         # Infer head_dim if not explicitly set
@@ -86,6 +94,18 @@ class ModelConfig:
         # Default KV heads to Q heads (MHA)
         if self.num_key_value_heads <= 0:
             self.num_key_value_heads = self.num_attention_heads
+        if self.qk_head_dim <= 0:
+            # Prefer the explicit MLA split when present. Otherwise fall back to
+            # the standard attention head width so expanded-cache reporting still
+            # has a usable per-head width on partially specified configs.
+            inferred_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
+            self.qk_head_dim = inferred_qk if inferred_qk > 0 else self.head_dim
+        if self.first_k_dense_replace < 0:
+            self.first_k_dense_replace = 0
+        if self.cache_layout == "standard" and self.use_mla:
+            # MLA models need an explicit non-standard cache layout even when the
+            # raw config does not provide one.
+            self.cache_layout = "mla_compressed"
 
     @property
     def kv_dim(self) -> int:
@@ -98,13 +118,38 @@ class ModelConfig:
         return self.qk_nope_head_dim + self.qk_rope_head_dim
 
     @property
+    def q_proj_width(self) -> int:
+        return self.num_attention_heads * self.head_dim
+
+    @property
+    def kv_proj_width(self) -> int:
+        return self.num_key_value_heads * self.head_dim
+
+    @property
+    def attn_out_width(self) -> int:
+        if self.use_mla and self.v_head_dim > 0:
+            return self.num_attention_heads * self.v_head_dim
+        return self.q_proj_width
+
+    @property
     def mla_kv_cache_per_token(self) -> int:
         """Elements stored in KV cache per token for MLA.
 
         MLA caches the compressed KV latent (kv_lora_rank) plus the
         RoPE-applied key portion (qk_rope_head_dim), instead of full KV.
         """
+        if self.cache_layout == "mla_expanded":
+            return self.num_attention_heads * (self.qk_head_dim + self.v_head_dim)
         return self.kv_lora_rank + self.qk_rope_head_dim
+
+    @property
+    def attention_output_bias(self) -> bool:
+        """Return whether the attention output projection uses a bias term."""
+        if self.use_mla:
+            return self.attention_bias
+        if self.model_type.startswith("glm"):
+            return False
+        return self.attention_bias
 
     @property
     def attention_type(self) -> str:
@@ -118,6 +163,13 @@ class ModelConfig:
         if self.num_key_value_heads < self.num_attention_heads:
             return "GQA"
         return "MHA"
+
+    def is_sparse_layer(self, layer_idx: int) -> bool:
+        if self.mlp_layer_types is not None and 0 <= layer_idx < len(self.mlp_layer_types):
+            return self.mlp_layer_types[layer_idx].lower() == "sparse"
+        if not self.is_moe or self.num_experts <= 1:
+            return False
+        return layer_idx >= self.first_k_dense_replace
 
 
 # ---------------------------------------------------------------------------
@@ -207,10 +259,20 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
                                "top_k", default=2 if num_experts > 0 else 0))
     moe_inter = int(_get(cfg, "moe_intermediate_size", default=0))
     is_moe = num_experts > 1
+    num_shared_experts = int(_get(cfg, "n_shared_experts", "num_shared_experts", default=0))
+    raw_mlp_layer_types = _get(cfg, "mlp_layer_types", default=None)
+    mlp_layer_types = list(raw_mlp_layer_types) if isinstance(raw_mlp_layer_types, list) else None
+    first_k_dense_replace = int(_get(
+        cfg,
+        "first_k_dense_replace",
+        default=0 if is_moe else num_layers,
+    ))
 
     # Biases ——————————————————————————————————————————————————————————————
     attn_bias = bool(_get(cfg, "attention_bias", "add_bias_linear", default=False))
     mlp_bias = bool(_get(cfg, "mlp_bias", default=False))
+    use_qk_norm = bool(_get(cfg, "use_qk_norm", default=False))
+    num_nextn_predict_layers = int(_get(cfg, "num_nextn_predict_layers", default=0))
 
     max_pos = int(_get(cfg, "max_position_embeddings", "seq_length",
                         "max_sequence_length", default=4096))
@@ -218,6 +280,7 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
     # MLA (Multi-Latent Attention) ——————————————————————————————————————
     kv_lora_rank = int(_get(cfg, "kv_lora_rank", default=0))
     q_lora_rank = int(_get(cfg, "q_lora_rank", default=0))
+    qk_head_dim = int(_get(cfg, "qk_head_dim", default=0))
     qk_nope_head_dim = int(_get(cfg, "qk_nope_head_dim", "qk_head_dim", default=0))
     qk_rope_head_dim = int(_get(cfg, "qk_rope_head_dim", "qk_pos_emb_head_dim", default=0))
     v_head_dim = int(_get(cfg, "v_head_dim", default=0))
@@ -228,6 +291,11 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
     index_n_heads = int(_get(cfg, "index_n_heads", "index_num_attention_heads", default=0))
     index_topk = int(_get(cfg, "index_topk", default=2048))
     use_dsa = index_n_heads > 0
+    default_cache_layout = "standard"
+    if use_mla:
+        default_cache_layout = "mla_expanded" if model_type.startswith("glm") else "mla_compressed"
+    cache_layout = str(_get(cfg, "cache_layout", default=default_cache_layout))
+    dsa_indexer_mode = str(_get(cfg, "dsa_indexer_mode", default="fused_topk"))
 
     return ModelConfig(
         name=name,
@@ -246,12 +314,18 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
         num_experts=num_experts,
         num_experts_per_tok=experts_per_tok,
         moe_intermediate_size=moe_inter,
+        num_shared_experts=num_shared_experts,
+        first_k_dense_replace=first_k_dense_replace,
+        mlp_layer_types=mlp_layer_types,
         max_position_embeddings=max_pos,
         attention_bias=attn_bias,
         mlp_bias=mlp_bias,
+        use_qk_norm=use_qk_norm,
+        num_nextn_predict_layers=num_nextn_predict_layers,
         use_mla=use_mla,
         kv_lora_rank=kv_lora_rank,
         q_lora_rank=q_lora_rank,
+        qk_head_dim=qk_head_dim,
         qk_nope_head_dim=qk_nope_head_dim,
         qk_rope_head_dim=qk_rope_head_dim,
         v_head_dim=v_head_dim,
@@ -259,6 +333,8 @@ def _parse_generic(cfg: dict, name: str) -> ModelConfig:
         index_head_dim=index_head_dim,
         index_n_heads=index_n_heads,
         index_topk=index_topk,
+        cache_layout=cache_layout,
+        dsa_indexer_mode=dsa_indexer_mode,
     )
 
 

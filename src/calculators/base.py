@@ -13,6 +13,7 @@ Key design choices
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List
@@ -38,6 +39,7 @@ _DTYPE_BYTES = {
     DType.INT8: 1,
     DType.INT4: 0.5,
 }
+INT4_ELEMENTS_PER_BYTE = 2
 
 
 def dtype_bytes(dtype: DType | str) -> float:
@@ -45,6 +47,15 @@ def dtype_bytes(dtype: DType | str) -> float:
     if isinstance(dtype, str):
         dtype = DType(dtype.lower())
     return _DTYPE_BYTES[dtype]
+
+
+def elements_to_bytes(num_elements: int | float, dtype: DType | str) -> int:
+    """Return packed byte size for a tensor with the given number of elements."""
+    if isinstance(dtype, str):
+        dtype = DType(dtype.lower())
+    if dtype == DType.INT4:
+        return math.ceil(num_elements / INT4_ELEMENTS_PER_BYTE)
+    return math.ceil(num_elements * _DTYPE_BYTES[dtype])
 
 
 # ---------------------------------------------------------------------------
@@ -66,7 +77,10 @@ class ComputeStats:
     weight_bytes : int
         Bytes required to store this component's parameters.
     act_bytes : int
-        Peak activation memory (bytes) needed during the forward pass.
+        Working-set activation memory estimate (bytes) — the maximum concurrently
+        live activation tensor size for this component during a forward pass.
+        Computed as max(child.act_bytes) across children; not a liveness-scheduled
+        peak (see review item N).
     hbm_read_bytes : int
         Bytes read from HBM (weights + inputs).
     hbm_write_bytes : int

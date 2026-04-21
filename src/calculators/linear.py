@@ -23,7 +23,7 @@ from __future__ import annotations
 import math
 from dataclasses import dataclass
 
-from .base import ComputeStats, DType, dtype_bytes
+from .base import ComputeStats, DType, dtype_bytes, elements_to_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -45,8 +45,6 @@ class LinearStats:
     def compute(self) -> ComputeStats:
         B, s = self.batch_size, self.seq_len
         in_f, out_f = self.in_features, self.out_features
-        eb = dtype_bytes(self.dtype)
-
         # Parameters
         n_params = in_f * out_f + (out_f if self.has_bias else 0)
 
@@ -54,16 +52,16 @@ class LinearStats:
         flops = 2 * B * s * in_f * out_f
 
         # Weight bytes (stored in model)
-        w_bytes = int(n_params * eb)
+        w_bytes = elements_to_bytes(n_params, self.dtype)
 
         # HBM traffic
         tokens = B * s
         param_elems = n_params  # weights plus bias when present
-        hbm_read = int((tokens * in_f + param_elems) * eb)
-        hbm_write = int(tokens * out_f * eb)
+        hbm_read = elements_to_bytes(tokens * in_f + param_elems, self.dtype)
+        hbm_write = elements_to_bytes(tokens * out_f, self.dtype)
 
         # Activation memory (input + output tensors)
-        act = int((tokens * in_f + tokens * out_f) * eb)
+        act = elements_to_bytes(tokens * in_f + tokens * out_f, self.dtype)
 
         return ComputeStats(
             name=self.name,
@@ -129,17 +127,25 @@ def qkv_proj_stats(
 # ---------------------------------------------------------------------------
 
 def output_proj_stats(
-    hidden_size: int,
+    hidden_size: int | None = None,
+    in_features: int | None = None,
+    out_features: int | None = None,
     seq_len: int = 1,
     batch_size: int = 1,
     has_bias: bool = False,
     dtype: DType = DType.BF16,
 ) -> ComputeStats:
     """Return ComputeStats for the attention output projection (O = AV W_o)."""
+    if in_features is None:
+        in_features = hidden_size
+    if out_features is None:
+        out_features = hidden_size
+    if in_features is None or out_features is None:
+        raise ValueError("output_proj_stats requires hidden_size or explicit in/out features")
     return LinearStats(
         name="O Projection",
-        in_features=hidden_size,
-        out_features=hidden_size,
+        in_features=in_features,
+        out_features=out_features,
         has_bias=has_bias,
         seq_len=seq_len,
         batch_size=batch_size,
