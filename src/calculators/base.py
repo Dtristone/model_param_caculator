@@ -13,6 +13,7 @@ Key design choices
 
 from __future__ import annotations
 
+import math
 from dataclasses import dataclass, field
 from enum import Enum
 from typing import List
@@ -45,6 +46,15 @@ def dtype_bytes(dtype: DType | str) -> float:
     if isinstance(dtype, str):
         dtype = DType(dtype.lower())
     return _DTYPE_BYTES[dtype]
+
+
+def elements_to_bytes(num_elements: int | float, dtype: DType | str) -> int:
+    """Return packed byte size for a tensor with the given number of elements."""
+    if isinstance(dtype, str):
+        dtype = DType(dtype.lower())
+    if dtype == DType.INT4:
+        return math.ceil(num_elements / 2)
+    return int(num_elements * _DTYPE_BYTES[dtype])
 
 
 # ---------------------------------------------------------------------------

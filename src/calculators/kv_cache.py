@@ -45,7 +45,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Optional
 
-from .base import ComputeStats, DType, dtype_bytes
+from .base import DType, elements_to_bytes
 
 DEFAULT_HEAD_DIM = 128
 
@@ -105,14 +105,19 @@ def kv_cache_stats(
     seq_len: int = 2048,
     batch_size: int = 1,
     dtype: DType = DType.BF16,
+    q_len: int | None = None,
+    kv_len: int | None = None,
+    cache_len: int | None = None,
     # MLA params
     use_mla: bool = False,
     kv_lora_rank: int = 0,
+    qk_head_dim: int = 0,
     qk_rope_head_dim: int = 0,
     v_head_dim: int = 0,
     # DSA params
     use_dsa: bool = False,
     index_head_dim: int = 0,
+    cache_layout: str = "standard",
     # Hit ratio
     hit_ratio: float = 0.0,
 ) -> KVCacheStats:
@@ -124,14 +129,21 @@ def kv_cache_stats(
         Fraction of tokens whose KV cache entries are already present
         (0.0 = all new, 1.0 = all cached / decode step).
     """
-    eb = dtype_bytes(dtype)
     B = batch_size
     hit_ratio = min(max(hit_ratio, 0.0), 1.0)
+    Q = q_len if q_len is not None else seq_len
+    T = kv_len if kv_len is not None else seq_len
+    cache_tokens = cache_len if cache_len is not None else T
 
     if use_mla:
-        # MLA: cache compressed latent + RoPE key
-        k_per_token = kv_lora_rank + qk_rope_head_dim  # compressed KV
-        v_per_token = 0    # V is part of the compressed latent
+        if cache_layout == "mla_expanded":
+            qk_dim = qk_head_dim if qk_head_dim > 0 else qk_rope_head_dim
+            k_per_token = num_q_heads * qk_dim
+            v_per_token = num_q_heads * v_head_dim
+        else:
+            # MLA: cache compressed latent + RoPE key
+            k_per_token = kv_lora_rank + qk_rope_head_dim
+            v_per_token = 0
         total_per_token = k_per_token
         idx_per_token = index_head_dim if use_dsa else 0
         total_per_token += idx_per_token
@@ -162,13 +174,13 @@ def kv_cache_stats(
 
     compression_ratio = mha_equiv / total_per_token if total_per_token > 0 else 1.0
 
-    per_token_per_layer_bytes = total_per_token * eb
+    per_token_per_layer_bytes = elements_to_bytes(total_per_token, dtype)
     per_token_all_layers = per_token_per_layer_bytes * num_layers
-    total_cache = per_token_all_layers * seq_len * B
+    total_cache = per_token_all_layers * cache_tokens * B
 
     # Hit ratio analysis
-    cached_tokens = int(seq_len * hit_ratio)
-    new_tokens = seq_len - cached_tokens
+    cached_tokens = int(cache_tokens * hit_ratio)
+    new_tokens = max(cache_tokens - cached_tokens, 0)
 
     # FLOPs saved: cache-producing paths only.
     # MLA: kv_a_proj only.
@@ -185,10 +197,10 @@ def kv_cache_stats(
     else:
         kv_proj_flops_per_token = 2 * 2 * hidden_size * num_kv_heads * head_dim
 
-    kv_proj_flops_saved = B * cached_tokens * kv_proj_flops_per_token * num_layers
+    kv_proj_flops_saved = B * min(cached_tokens, cache_tokens) * kv_proj_flops_per_token * num_layers
 
     # HBM writes saved: don't need to write KV cache for cached tokens
-    hbm_write_saved = int(B * cached_tokens * total_per_token * eb * num_layers)
+    hbm_write_saved = elements_to_bytes(B * cached_tokens * total_per_token * num_layers, dtype)
 
     return KVCacheStats(
         attention_type=attn_type,
@@ -200,7 +212,7 @@ def kv_cache_stats(
         per_token_all_layers_bytes=per_token_all_layers,
         total_cache_bytes=total_cache,
         num_layers=num_layers,
-        seq_len=seq_len,
+        seq_len=cache_tokens,
         batch_size=batch_size,
         compression_ratio=compression_ratio,
         hit_ratio=hit_ratio,

@@ -24,7 +24,7 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 import pytest
 
-from src.calculators.base import ComputeStats, DType, fmt_num, fmt_bytes, dtype_bytes
+from src.calculators.base import ComputeStats, DType, fmt_num, fmt_bytes, dtype_bytes, elements_to_bytes
 from src.calculators.linear import LinearStats, qkv_proj_stats, output_proj_stats
 from src.calculators.attention import attention_stats
 from src.calculators.ffn import ffn_stats
@@ -42,11 +42,51 @@ _CONFIGS_DIR = Path(__file__).parent.parent / "configs"
 
 
 def _qwen2_cfg() -> ModelConfig:
-    return load_config(_CONFIGS_DIR / "qwen2_7b.json", name="Qwen2-7B")
+    return from_dict(
+        {
+            "model_type": "qwen2",
+            "hidden_size": 3584,
+            "num_hidden_layers": 28,
+            "num_attention_heads": 28,
+            "num_key_value_heads": 4,
+            "intermediate_size": 18944,
+            "vocab_size": 152064,
+            "hidden_act": "silu",
+            "tie_word_embeddings": False,
+        },
+        name="Qwen2-7B",
+    )
 
 
 def _glm4_cfg() -> ModelConfig:
-    return load_config(_CONFIGS_DIR / "glm4_9b.json", name="GLM-4-9B")
+    return load_config(_CONFIGS_DIR / "config_glm4.7.json", name="GLM-4.7")
+
+
+def _mla_cfg() -> ModelConfig:
+    return from_dict(
+        {
+            "model_type": "deepseek_v2",
+            "hidden_size": 2048,
+            "num_hidden_layers": 27,
+            "num_attention_heads": 16,
+            "num_key_value_heads": 16,
+            "intermediate_size": 10944,
+            "vocab_size": 100015,
+            "kv_lora_rank": 512,
+            "q_lora_rank": 1536,
+            "qk_nope_head_dim": 128,
+            "qk_rope_head_dim": 64,
+            "qk_head_dim": 192,
+            "v_head_dim": 128,
+            "hidden_act": "silu",
+            "cache_layout": "mla_compressed",
+        },
+        name="DS-V2-Lite",
+    )
+
+
+def _glm5_cfg() -> ModelConfig:
+    return load_config(_CONFIGS_DIR / "config_glm5.json", name="GLM-5")
 
 
 # ---------------------------------------------------------------------------
@@ -209,6 +249,22 @@ class TestAttentionStats:
         # With flash attention, HBM = Q+K+V+O; K+V in GQA is smaller
         assert gqa.hbm_total_bytes < mha.hbm_total_bytes
 
+    def test_explicit_qkv_widths_and_lengths(self):
+        stats = attention_stats(
+            hidden_size=5120,
+            num_q_heads=96,
+            num_kv_heads=8,
+            head_dim=128,
+            seq_len=1,
+            q_len=1,
+            kv_len=2048,
+            q_width=96 * 128,
+            kv_width=8 * 128,
+            attn_out_width=96 * 128,
+            use_flash_attn=True,
+        )
+        assert stats.hbm_read_bytes > stats.hbm_write_bytes
+
 
 # ---------------------------------------------------------------------------
 # 4. FFN
@@ -311,6 +367,10 @@ class TestMoEStats:
         # router params scale with E; expert params scale with E
         assert moe8.num_params > moe4.num_params
 
+    def test_shared_expert_added_once(self):
+        moe = moe_stats(512, 8, 2, 1024, num_shared_experts=1)
+        assert any("Shared Expert" in child.name for child in moe.children)
+
 
 # ---------------------------------------------------------------------------
 # 6. Full model parameter counts
@@ -326,11 +386,11 @@ class TestModelStats:
             f"Expected ~7.6B, got {fmt_num(ms.total.num_params)}"
 
     def test_glm4_9b_total_params(self):
-        """GLM-4-9B should have ~9B parameters."""
+        """GLM-4.7 should have the reviewed 300B+ scale parameter count."""
         cfg = _glm4_cfg()
         ms = model_stats(cfg, seq_len=1, batch_size=1)
-        assert 8.5e9 < ms.total.num_params < 10.0e9, \
-            f"Expected ~9B, got {fmt_num(ms.total.num_params)}"
+        assert 3.0e11 < ms.total.num_params < 3.7e11, \
+            f"Expected reviewed GLM-4.7 scale, got {fmt_num(ms.total.num_params)}"
 
     def test_flops_scale_with_seq_len_squared_in_attn(self):
         """Attention FLOPs should scale as s² when seq_len increases."""
@@ -385,6 +445,13 @@ class TestModelStats:
         fp32 = model_stats(cfg, seq_len=1, dtype=DType.FP32)
         assert fp32.total.weight_bytes == 2 * bf16.total.weight_bytes
 
+    def test_glm47_uses_dense_and_sparse_layer_templates(self):
+        cfg = _glm4_cfg()
+        ms = model_stats(cfg, seq_len=1, batch_size=1)
+        layer_names = [layer.name for layer in ms.layer_breakdown]
+        assert any("Dense" in name for name in layer_names)
+        assert any("Sparse" in name for name in layer_names)
+
 
 # ---------------------------------------------------------------------------
 # 7. Config parser
@@ -413,20 +480,23 @@ class TestConfigParser:
         assert cfg.ffn_type == "swiglu"
 
     def test_glm4_field_aliases(self):
-        """GLM config uses num_layers and ffn_hidden_size instead of standard names."""
+        """GLM config fields should map to the current GLM-4.7 config."""
         cfg = _glm4_cfg()
-        assert cfg.num_hidden_layers == 40
-        assert cfg.intermediate_size == 13696
-        assert cfg.num_key_value_heads == 2
+        assert cfg.num_hidden_layers == 92
+        assert cfg.intermediate_size == 12288
+        assert cfg.num_key_value_heads == 8
+        assert cfg.num_shared_experts == 1
+        assert cfg.first_k_dense_replace == 3
 
     def test_glm4_gqa(self):
         cfg = _glm4_cfg()
         assert cfg.attention_type == "GQA"
 
     def test_glm4_norm_type(self):
-        """GLM-4-9B has rmsnorm=True in config, so norm_type should be rmsnorm."""
+        """GLM-4.7 uses RMSNorm and QK norm."""
         cfg = _glm4_cfg()
         assert cfg.norm_type == "rmsnorm"
+        assert cfg.use_qk_norm is True
 
     def test_from_dict(self):
         """from_dict should produce a valid ModelConfig."""
@@ -538,6 +608,10 @@ class TestBaseHelpers:
         assert dtype_bytes(DType.INT8) == 1
         assert dtype_bytes(DType.INT4) == 0.5
 
+    def test_int4_byte_rounding(self):
+        assert elements_to_bytes(3, DType.INT4) == 2
+        assert elements_to_bytes(4, DType.INT4) == 2
+
     def test_compute_stats_add(self):
         a = ComputeStats("a", num_params=100, flops=200, weight_bytes=300,
                          hbm_read_bytes=400, hbm_write_bytes=50)
@@ -575,7 +649,10 @@ class TestMLAStats:
             qk_nope_head_dim=128, qk_rope_head_dim=64,
             v_head_dim=128, seq_len=8, batch_size=1,
         )
-        assert len(s.children) == 7
+        assert len(s.children) == 9
+        child_names = [child.name for child in s.children]
+        assert "KV latent RMSNorm (kv_a_layernorm)" in child_names
+        assert "Q latent RMSNorm (q_a_layernorm)" in child_names
 
     def test_mla_proj_without_q_lora(self):
         """Without q_lora, absorbed MLA keeps kv_a, kv_b weights, q_direct, q_absorb, v_expand, o_proj."""
@@ -585,7 +662,7 @@ class TestMLAStats:
             qk_nope_head_dim=128, qk_rope_head_dim=64,
             v_head_dim=128, seq_len=8, batch_size=1,
         )
-        assert len(s.children) == 6
+        assert len(s.children) == 7
 
     def test_kv_b_proj_has_zero_flops(self):
         """Stored kv_b weight tensor has 0 direct FLOPs."""
@@ -595,7 +672,7 @@ class TestMLAStats:
             qk_nope_head_dim=128, qk_rope_head_dim=64,
             v_head_dim=128, seq_len=8, batch_size=1,
         )
-        kv_b = s.children[1]  # kv_b_proj (absorbed)
+        kv_b = next(child for child in s.children if child.name == "KV up-proj weights (absorbed)")
         assert kv_b.flops == 0
         assert kv_b.num_params > 0  # still has parameters
         assert kv_b.weight_bytes > 0
@@ -608,8 +685,8 @@ class TestMLAStats:
             qk_nope_head_dim=128, qk_rope_head_dim=64,
             v_head_dim=128, seq_len=8, batch_size=1,
         )
-        assert s.children[4].flops > 0  # q_absorb
-        assert s.children[5].flops > 0  # v_expand
+        assert next(child for child in s.children if "Q absorb" in child.name).flops > 0
+        assert next(child for child in s.children if "V expand" in child.name).flops > 0
 
     def test_kv_b_params_count(self):
         """kv_b params = c_kv × a × (d_n + v_dim)."""
@@ -620,7 +697,7 @@ class TestMLAStats:
             qk_nope_head_dim=d_n, qk_rope_head_dim=64,
             v_head_dim=v_dim, seq_len=8, batch_size=1,
         )
-        kv_b = s.children[1]
+        kv_b = next(child for child in s.children if child.name == "KV up-proj weights (absorbed)")
         expected = c_kv * a * (d_n + v_dim)
         assert kv_b.num_params == expected
 
@@ -725,7 +802,7 @@ class TestDSAStats:
             c_q * idx_a * idx_h     # wq_b
             + h * idx_h              # wk
             + h * idx_a              # weights_proj
-            + 2 * idx_h              # k_norm (scale + bias)
+            + idx_h                  # k_norm (RMSNorm scale)
         )
         s = dsa_indexer_stats(
             hidden_size=h, q_lora_rank=c_q,
@@ -847,6 +924,15 @@ class TestKVCache:
         assert kv.index_cache_per_token == 128
         assert kv.total_per_token == 512 + 64 + 128
 
+    def test_mla_expanded_cache_layout(self):
+        kv = kv_cache_stats(
+            hidden_size=6144, num_q_heads=64, num_kv_heads=64,
+            head_dim=64, num_layers=78, seq_len=1,
+            use_mla=True, kv_lora_rank=512, qk_head_dim=256, qk_rope_head_dim=64,
+            v_head_dim=256, use_dsa=True, index_head_dim=128, cache_layout="mla_expanded",
+        )
+        assert kv.total_per_token == 64 * 256 + 64 * 256 + 128
+
     def test_total_cache_bytes(self):
         """Total cache = per_token × layers × seq_len × batch × elem_size."""
         kv = kv_cache_stats(
@@ -902,7 +988,7 @@ class TestConfigParserMLA:
 
     def test_deepseek_v2_lite_mla_fields(self):
         """DeepSeek-V2-Lite should be parsed as MLA model."""
-        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json", name="DS-V2-Lite")
+        cfg = _mla_cfg()
         assert cfg.use_mla is True
         assert cfg.head_dim == 128
         assert cfg.kv_lora_rank == 512
@@ -911,25 +997,27 @@ class TestConfigParserMLA:
         assert cfg.qk_rope_head_dim == 64
         assert cfg.v_head_dim == 128
         assert cfg.attention_type == "MLA"
+        assert cfg.cache_layout == "mla_compressed"
 
     def test_glm5_dsa_fields(self):
         """GLM-5 should be parsed as DSA+MLA model."""
-        cfg = load_config(_CONFIGS_DIR / "glm5_9b.json", name="GLM-5-9B")
+        cfg = _glm5_cfg()
         assert cfg.use_mla is True
         assert cfg.use_dsa is True
-        assert cfg.index_n_heads == 8
+        assert cfg.index_n_heads == 32
         assert cfg.index_head_dim == 128
         assert cfg.index_topk == 2048
         assert cfg.attention_type == "DSA+MLA"
+        assert cfg.cache_layout == "mla_expanded"
 
     def test_mla_kv_cache_per_token(self):
         """mla_kv_cache_per_token property should work correctly."""
-        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json")
+        cfg = _mla_cfg()
         assert cfg.mla_kv_cache_per_token == 512 + 64
 
     def test_non_mla_model_defaults(self):
         """Non-MLA models should have use_mla=False."""
-        cfg = load_config(_CONFIGS_DIR / "qwen2_7b.json")
+        cfg = _qwen2_cfg()
         assert cfg.use_mla is False
         assert cfg.use_dsa is False
         assert cfg.kv_lora_rank == 0
@@ -962,7 +1050,7 @@ class TestModelStatsMLA:
 
     def test_deepseek_v2_lite_model_stats(self):
         """DeepSeek-V2-Lite model stats should complete without error."""
-        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json", name="DS-V2-Lite")
+        cfg = _mla_cfg()
         ms = model_stats(cfg, seq_len=512, batch_size=1)
         assert ms.total.num_params > 0
         assert ms.total.flops > 0
@@ -971,7 +1059,7 @@ class TestModelStatsMLA:
 
     def test_glm5_model_stats(self):
         """GLM-5 model stats should complete without error."""
-        cfg = load_config(_CONFIGS_DIR / "glm5_9b.json", name="GLM-5-9B")
+        cfg = _glm5_cfg()
         ms = model_stats(cfg, seq_len=512, batch_size=1)
         assert ms.total.num_params > 0
         assert ms.total.flops > 0
@@ -980,16 +1068,16 @@ class TestModelStatsMLA:
 
     def test_glm5_has_indexer_in_layer(self):
         """GLM-5 layer breakdown should include DSA Indexer."""
-        cfg = load_config(_CONFIGS_DIR / "glm5_9b.json", name="GLM-5-9B")
+        cfg = _glm5_cfg()
         ms = model_stats(cfg, seq_len=512, batch_size=1)
-        layer = ms.layer_breakdown[0]
-        child_names = [c.name for c in layer.children]
+        sparse_layer = next(layer for layer in ms.layer_breakdown if "Sparse" in layer.name)
+        child_names = [c.name for c in sparse_layer.children]
         assert any("Indexer" in n for n in child_names)
         assert any("Sparse" in n for n in child_names)
 
     def test_mla_model_has_mla_proj_in_layer(self):
         """MLA model layer should have MLA Projection."""
-        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json")
+        cfg = _mla_cfg()
         ms = model_stats(cfg, seq_len=512, batch_size=1)
         layer = ms.layer_breakdown[0]
         child_names = [c.name for c in layer.children]
@@ -997,7 +1085,7 @@ class TestModelStatsMLA:
 
     def test_kv_cache_with_hit_ratio(self):
         """KV hit ratio should propagate to model stats."""
-        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json")
+        cfg = _mla_cfg()
         ms = model_stats(cfg, seq_len=2048, batch_size=1, kv_hit_ratio=0.5)
         assert ms.kv_cache.hit_ratio == 0.5
         assert ms.kv_cache.cached_tokens == 1024
@@ -1005,7 +1093,7 @@ class TestModelStatsMLA:
 
     def test_standard_model_still_has_kv_cache(self):
         """Standard (non-MLA) models should also have KV cache stats."""
-        cfg = load_config(_CONFIGS_DIR / "qwen2_7b.json")
+        cfg = _qwen2_cfg()
         ms = model_stats(cfg, seq_len=2048)
         assert ms.kv_cache is not None
         assert ms.kv_cache.attention_type == "GQA"
@@ -1019,7 +1107,7 @@ class TestModelStatsMLA:
 class TestVisualizerMLA:
     def test_mla_diagram(self):
         """MLA model diagram should show MLA-specific projections."""
-        cfg = load_config(_CONFIGS_DIR / "deepseek_v2_lite.json", name="DS-V2-Lite")
+        cfg = _mla_cfg()
         diagram = visualize(cfg)
         assert "MLA" in diagram
         assert "KV down-proj" in diagram
@@ -1028,7 +1116,7 @@ class TestVisualizerMLA:
 
     def test_dsa_diagram(self):
         """DSA model diagram should show DSA+MLA and indexer."""
-        cfg = load_config(_CONFIGS_DIR / "glm5_9b.json", name="GLM-5-9B")
+        cfg = _glm5_cfg()
         diagram = visualize(cfg)
         assert "DSA+MLA" in diagram
         assert "Indexer" in diagram
@@ -1036,7 +1124,7 @@ class TestVisualizerMLA:
 
     def test_standard_diagram_unchanged(self):
         """Standard model diagram should still work as before."""
-        cfg = load_config(_CONFIGS_DIR / "qwen2_7b.json", name="Qwen2-7B")
+        cfg = _qwen2_cfg()
         diagram = visualize(cfg)
         assert "Q proj" in diagram
         assert "K proj" in diagram

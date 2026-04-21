@@ -80,13 +80,19 @@ def _rich_report(ms: ModelStats) -> None:
         f"  ffn_type     : {cfg.ffn_type.upper()}",
         f"  vocab_size   : {cfg.vocab_size}",
         f"  dtype        : {ms.dtype.value}",
-        f"  seq_len      : {ms.seq_len}",
+        f"  q_len / kv_len / cache_len : {ms.q_len} / {ms.kv_len} / {ms.cache_len}",
         f"  batch_size   : {ms.batch_size}",
         f"  attn_mode    : {flash_label}",
+        f"  cache_layout : {cfg.cache_layout}",
     ]
     if cfg.is_moe:
         header_lines.append(
-            f"  MoE          : {cfg.num_experts} experts, top-{cfg.num_experts_per_tok}"
+            f"  MoE          : routed={cfg.num_experts}, shared={cfg.num_shared_experts}, top-{cfg.num_experts_per_tok}"
+        )
+        header_lines.append(f"  dense_prefix : first {cfg.first_k_dense_replace} layers")
+    if cfg.num_nextn_predict_layers > 0:
+        header_lines.append(
+            f"  MTP          : excluded ({cfg.num_nextn_predict_layers} next-n prediction layers not modeled)"
         )
     console.print(Panel("\n".join(header_lines), title="Model Configuration", expand=False))
 
@@ -121,24 +127,24 @@ def _rich_report(ms: ModelStats) -> None:
 
     # ---- Per-layer breakdown ----------------------------------------------
     if ms.layer_breakdown:
-        one = ms.layer_breakdown[0]
-        layer_table = Table(
-            title="Per-Layer Component Breakdown (one representative layer)",
-            box=rich_box.SIMPLE_HEAVY,
-            show_lines=True,
-        )
-        for col, sty in zip(cols, styles):
-            layer_table.add_column(col, style=sty, no_wrap=True)
+        for one in ms.layer_breakdown:
+            layer_table = Table(
+                title=f"Per-Layer Component Breakdown ({one.name})",
+                box=rich_box.SIMPLE_HEAVY,
+                show_lines=True,
+            )
+            for col, sty in zip(cols, styles):
+                layer_table.add_column(col, style=sty, no_wrap=True)
 
-        for child in one.children:
-            layer_table.add_row(*_row(child, one.num_params, one.flops))
+            for child in one.children:
+                layer_table.add_row(*_row(child, one.num_params, one.flops))
 
-        layer_table.add_row(*["─" * 8] * len(cols))
-        layer_table.add_row(
-            *_row(one, one.num_params, one.flops),
-            style="bold",
-        )
-        console.print(layer_table)
+            layer_table.add_row(*["─" * 8] * len(cols))
+            layer_table.add_row(
+                *_row(one, one.num_params, one.flops),
+                style="bold",
+            )
+            console.print(layer_table)
 
     # ---- Attention comparison table (std vs flash) -------------------------
     _attn_comparison(console, ms)
@@ -153,7 +159,7 @@ def _attn_comparison(console, ms: ModelStats) -> None:
     from .calculators.attention import attention_stats
 
     cfg = ms.config
-    B, s = ms.batch_size, ms.seq_len
+    B = ms.batch_size
 
     # Skip comparison for MLA/DSA models (different architecture)
     if cfg.use_mla:
@@ -164,24 +170,34 @@ def _attn_comparison(console, ms: ModelStats) -> None:
         num_q_heads=cfg.num_attention_heads,
         num_kv_heads=cfg.num_key_value_heads,
         head_dim=cfg.head_dim,
-        seq_len=s,
+        seq_len=ms.q_len,
         batch_size=B,
         use_flash_attn=False,
         dtype=ms.dtype,
+        q_len=ms.q_len,
+        kv_len=ms.kv_len,
+        q_width=cfg.q_proj_width,
+        kv_width=cfg.kv_proj_width,
+        attn_out_width=cfg.q_proj_width,
     )
     flash = attention_stats(
         hidden_size=cfg.hidden_size,
         num_q_heads=cfg.num_attention_heads,
         num_kv_heads=cfg.num_key_value_heads,
         head_dim=cfg.head_dim,
-        seq_len=s,
+        seq_len=ms.q_len,
         batch_size=B,
         use_flash_attn=True,
         dtype=ms.dtype,
+        q_len=ms.q_len,
+        kv_len=ms.kv_len,
+        q_width=cfg.q_proj_width,
+        kv_width=cfg.kv_proj_width,
+        attn_out_width=cfg.q_proj_width,
     )
 
     tbl = Table(
-        title=f"Attention Kernel Comparison (seq_len={s}, per layer)",
+        title=f"Attention Kernel Comparison (q_len={ms.q_len}, kv_len={ms.kv_len}, per layer)",
         box=rich_box.SIMPLE_HEAD,
     )
     tbl.add_column("Metric")
@@ -226,6 +242,7 @@ def _kv_cache_report(console, ms: ModelStats) -> None:
     tbl.add_column("Value", style="cyan")
 
     tbl.add_row("Attention Type", kv.attention_type)
+    tbl.add_row("Cache layout", ms.config.cache_layout)
 
     if kv.k_cache_per_token > 0:
         tbl.add_row("K cache per token", f"{kv.k_cache_per_token} elements")
@@ -240,7 +257,7 @@ def _kv_cache_report(console, ms: ModelStats) -> None:
     tbl.add_row("Total KV cache", fmt_bytes(kv.total_cache_bytes))
     tbl.add_row("Compression ratio vs MHA", f"{kv.compression_ratio:.1f}×")
     tbl.add_row("Layers", str(kv.num_layers))
-    tbl.add_row("Seq len", str(kv.seq_len))
+    tbl.add_row("Cache len", str(kv.seq_len))
     tbl.add_row("Batch size", str(kv.batch_size))
 
     if kv.hit_ratio > 0:
@@ -269,7 +286,10 @@ def _plain_report(ms: ModelStats) -> None:
     print(f"  hidden={cfg.hidden_size}  layers={cfg.num_hidden_layers}  "
           f"heads={cfg.num_attention_heads}/{cfg.num_key_value_heads}  "
           f"ffn={cfg.intermediate_size}  dtype={ms.dtype.value}")
-    print(f"  seq_len={ms.seq_len}  batch={ms.batch_size}")
+    print(f"  q_len={ms.q_len}  kv_len={ms.kv_len}  cache_len={ms.cache_len}  batch={ms.batch_size}")
+    print(f"  cache_layout={cfg.cache_layout}")
+    if cfg.num_nextn_predict_layers > 0:
+        print(f"  note: totals exclude {cfg.num_nextn_predict_layers} next-n prediction layers")
     print(f"{'='*70}")
 
     header = f"{'Component':<28} {'Params':>10} {'FLOPs':>10} {'Weight':>10} {'HBM':>10}"
@@ -286,16 +306,17 @@ def _plain_report(ms: ModelStats) -> None:
               f"{fmt_bytes(stats.weight_bytes):>10} {fmt_bytes(stats.hbm_total_bytes):>10}")
 
     print(f"\nPer-layer breakdown:")
-    if ms.layer_breakdown:
-        one = ms.layer_breakdown[0]
+    for one in ms.layer_breakdown:
+        print(f"  [{one.name}]")
         for child in one.children:
-            print(f"  {child.name:<26} {fmt_num(child.num_params):>10} {fmt_num(child.flops):>10} "
-                  f"{fmt_bytes(child.weight_bytes):>10} {fmt_bytes(child.hbm_total_bytes):>10}")
+            print(f"    {child.name:<24} {fmt_num(child.num_params):>10} {fmt_num(child.flops):>10} "
+                   f"{fmt_bytes(child.weight_bytes):>10} {fmt_bytes(child.hbm_total_bytes):>10}")
 
     # KV Cache
     if ms.kv_cache is not None:
         kv = ms.kv_cache
         print(f"\nKV Cache Analysis ({kv.attention_type}):")
+        print(f"  Cache layout: {cfg.cache_layout}")
         print(f"  Per token per layer: {kv.total_per_token} elements = {fmt_bytes(kv.per_token_per_layer_bytes)}")
         print(f"  Per token all layers: {fmt_bytes(kv.per_token_all_layers_bytes)}")
         print(f"  Total KV cache: {fmt_bytes(kv.total_cache_bytes)}")

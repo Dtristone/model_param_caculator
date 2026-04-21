@@ -42,7 +42,7 @@ Activation memory
 
 from __future__ import annotations
 
-from .base import ComputeStats, DType, dtype_bytes
+from .base import ComputeStats, DType, elements_to_bytes
 
 
 def attention_stats(
@@ -54,6 +54,11 @@ def attention_stats(
     batch_size: int = 1,
     use_flash_attn: bool = False,
     dtype: DType = DType.BF16,
+    q_len: int | None = None,
+    kv_len: int | None = None,
+    q_width: int | None = None,
+    kv_width: int | None = None,
+    attn_out_width: int | None = None,
 ) -> ComputeStats:
     """Compute stats for the attention kernel (excluding projections).
 
@@ -74,37 +79,39 @@ def attention_stats(
     use_flash_attn : bool
         If True, compute HBM access for Flash Attention.
     """
-    B, s, h = batch_size, seq_len, hidden_size
+    B = batch_size
     a, k, d = num_q_heads, num_kv_heads, head_dim
-    eb = dtype_bytes(dtype)
+    Q = q_len if q_len is not None else seq_len
+    T = kv_len if kv_len is not None else seq_len
+    q_width = q_width if q_width is not None else a * d
+    kv_width = kv_width if kv_width is not None else k * d
+    attn_out_width = attn_out_width if attn_out_width is not None else a * d
 
     # FLOPs —————————————————————————————————————————————————————————————
     # QK^T (note: with GQA each K head is shared by a/k Q heads,
     # but all a Q heads still compute s² attention → same total FLOPs)
-    flops_qkt = 2 * B * a * s * s * d       # = 2 * B * s² * h
-    flops_av  = 2 * B * a * s * s * d       # = 2 * B * s² * h
-    flops_softmax = 5 * B * a * s * s       # minor term
+    flops_qkt = 2 * B * a * Q * T * d
+    flops_av  = 2 * B * a * Q * T * d
+    flops_softmax = 5 * B * a * Q * T
 
     total_flops = flops_qkt + flops_softmax + flops_av
 
     # HBM access ————————————————————————————————————————————————————————
-    kv_dim = k * d  # = num_kv_heads * head_dim
-
     # Read Q, K, V
-    hbm_read_qkv = int((B * s * h + B * s * kv_dim + B * s * kv_dim) * eb)
+    hbm_read_qkv = elements_to_bytes(B * Q * q_width + B * T * kv_width + B * T * kv_width, dtype)
     # Write O
-    hbm_write_o = int(B * s * h * eb)
+    hbm_write_o = elements_to_bytes(B * Q * attn_out_width, dtype)
 
     if use_flash_attn:
         # Flash Attention: attention matrix never written to HBM
         hbm_read = hbm_read_qkv
         hbm_write = hbm_write_o
         # Activation: two per-row statistics buffers (m, l) for each head
-        act_bytes = int(2 * B * a * s * eb)
+        act_bytes = elements_to_bytes(2 * B * a * Q, dtype)
         label = "Flash Attention"
     else:
         # Standard Attention: write then read back attention matrix
-        attn_matrix = int(B * a * s * s * eb)
+        attn_matrix = elements_to_bytes(B * a * Q * T, dtype)
         hbm_read  = hbm_read_qkv + attn_matrix          # also read P for AV
         hbm_write = attn_matrix + hbm_write_o            # write P + write O
         # Activation: full attention matrix B×a×s×s

@@ -30,7 +30,7 @@ Three variants are supported:
 
 from __future__ import annotations
 
-from .base import ComputeStats, DType, dtype_bytes
+from .base import ComputeStats, DType, elements_to_bytes
 from .linear import LinearStats
 
 
@@ -64,7 +64,6 @@ def ffn_stats(
     """
     B, s = batch_size, seq_len
     h, ffn_h = hidden_size, intermediate_size
-    eb = dtype_bytes(dtype)
     ffn_type = ffn_type.lower()
 
     stats = ComputeStats(name=f"FFN ({ffn_type.upper()})")
@@ -81,9 +80,9 @@ def ffn_stats(
         ew = ComputeStats(
             name=f"{act_name} + multiply",
             flops=ew_flops,
-            hbm_read_bytes=int(2 * B * s * ffn_h * eb),   # read gate + up
-            hbm_write_bytes=int(B * s * ffn_h * eb),
-            act_bytes=int(B * s * ffn_h * eb),
+            hbm_read_bytes=elements_to_bytes(2 * B * s * ffn_h, dtype),   # read gate + up
+            hbm_write_bytes=elements_to_bytes(B * s * ffn_h, dtype),
+            act_bytes=elements_to_bytes(B * s * ffn_h, dtype),
         )
 
         stats.children = [gate, up, ew, down]
@@ -96,9 +95,9 @@ def ffn_stats(
         act = ComputeStats(
             name="Activation",
             flops=act_flops,
-            hbm_read_bytes=int(B * s * ffn_h * eb),
-            hbm_write_bytes=int(B * s * ffn_h * eb),
-            act_bytes=int(B * s * ffn_h * eb),
+            hbm_read_bytes=elements_to_bytes(B * s * ffn_h, dtype),
+            hbm_write_bytes=elements_to_bytes(B * s * ffn_h, dtype),
+            act_bytes=elements_to_bytes(B * s * ffn_h, dtype),
         )
 
         stats.children = [up, act, down]

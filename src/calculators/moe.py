@@ -26,7 +26,7 @@ Notes
 
 from __future__ import annotations
 
-from .base import ComputeStats, DType, dtype_bytes
+from .base import ComputeStats, DType
 from .ffn import ffn_stats
 from .linear import LinearStats
 
@@ -36,6 +36,7 @@ def moe_stats(
     num_experts: int,
     num_experts_per_tok: int,
     expert_intermediate_size: int,
+    num_shared_experts: int = 0,
     ffn_type: str = "swiglu",
     seq_len: int = 1,
     batch_size: int = 1,
@@ -63,10 +64,9 @@ def moe_stats(
     dtype : DType
         Element dtype.
     """
-    eb = dtype_bytes(dtype)
-    B, s = batch_size, seq_len
-
-    stats = ComputeStats(name=f"MoE (E={num_experts}, K={num_experts_per_tok})")
+    stats = ComputeStats(
+        name=f"MoE (routed={num_experts}, shared={num_shared_experts}, K={num_experts_per_tok})"
+    )
 
     # ------------------------------------------------------------------
     # 1. Router
@@ -95,7 +95,7 @@ def moe_stats(
         has_bias=has_bias,
         dtype=dtype,
     )
-    one_expert.name = f"Expert FFN ×{num_experts_per_tok} (active)"
+    one_expert.name = f"Routed Expert FFN ×{num_experts_per_tok} (active)"
 
     # Scale FLOPs to K active experts (keep params as E × one_expert.params)
     active_expert = ComputeStats(
@@ -109,6 +109,19 @@ def moe_stats(
         children=[],
     )
     stats.children.append(active_expert)
+
+    if num_shared_experts > 0:
+        shared_expert = ffn_stats(
+            hidden_size=hidden_size,
+            intermediate_size=expert_intermediate_size * num_shared_experts,
+            ffn_type=ffn_type,
+            seq_len=seq_len,
+            batch_size=batch_size,
+            has_bias=has_bias,
+            dtype=dtype,
+        )
+        shared_expert.name = f"Shared Expert FFN ×{num_shared_experts}"
+        stats.children.append(shared_expert)
 
     stats.aggregate_children()
     return stats
