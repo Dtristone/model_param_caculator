@@ -100,6 +100,8 @@ class ModelConfig:
         if self.first_k_dense_replace < 0:
             self.first_k_dense_replace = 0
         if self.cache_layout == "standard" and self.use_mla:
+            # MLA models need an explicit non-standard cache layout even when the
+            # raw config does not provide one.
             self.cache_layout = "mla_compressed"
 
     @property

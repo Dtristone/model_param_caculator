@@ -82,12 +82,12 @@ def dsa_indexer_stats(
         ).compute()
     )
 
-    k_norm_params = idx_h
+    k_norm_params = idx_h  # RMSNorm stores only a scale vector
     stats.children.append(
         ComputeStats(
             name="Indexer K norm",
             num_params=k_norm_params,
-            flops=4 * B * Q * idx_h,
+            flops=4 * B * Q * idx_h,  # RMSNorm: mean-sq + rsqrt + normalize + scale
             weight_bytes=elements_to_bytes(k_norm_params, dtype),
             hbm_read_bytes=elements_to_bytes(B * Q * idx_h + k_norm_params, dtype),
             hbm_write_bytes=elements_to_bytes(B * Q * idx_h, dtype),
