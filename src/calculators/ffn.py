@@ -76,8 +76,9 @@ def ffn_stats(
 
         # Element-wise activation + multiply (gate ⊙ act(up))
         # FLOPs are an approximation: 1 op for act(gate) + 1 op for element-wise multiply.
-        # Exact activation cost (SiLU ≈ 4–6 ops, GELU ≈ 8–14 ops) is platform-dependent
-        # and omitted in line with the accepted approximation for elementwise ops.
+        # Exact activation cost (SiLU ≈ 4–6 ops, GELU ≈ 8–14 ops) is platform-dependent.
+        # Using 2 ops per element follows the same convention as most FLOPs estimation tools
+        # (e.g. Megatron-LM, FLOPs counters in major ML papers) and is accepted for this use case.
         act_name = "SiLU" if ffn_type == "swiglu" else "GELU"
         ew_flops = 2 * B * s * ffn_h   # approximate: act(gate) + gate*up
         ew = ComputeStats(

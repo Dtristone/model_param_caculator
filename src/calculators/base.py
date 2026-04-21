@@ -77,7 +77,10 @@ class ComputeStats:
     weight_bytes : int
         Bytes required to store this component's parameters.
     act_bytes : int
-        Working-set activation memory estimate (bytes) for the forward pass.
+        Working-set activation memory estimate (bytes) — the maximum concurrently
+        live activation tensor size for this component during a forward pass.
+        Computed as max(child.act_bytes) across children; not a liveness-scheduled
+        peak (see review item N).
     hbm_read_bytes : int
         Bytes read from HBM (weights + inputs).
     hbm_write_bytes : int
