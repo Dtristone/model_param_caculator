@@ -75,8 +75,11 @@ def ffn_stats(
         down = LinearStats("Down proj", ffn_h, h, has_bias, s, B, dtype).compute()
 
         # Element-wise activation + multiply (gate ⊙ act(up))
+        # FLOPs are an approximation: 1 op for act(gate) + 1 op for element-wise multiply.
+        # Exact activation cost (SiLU ≈ 4–6 ops, GELU ≈ 8–14 ops) is platform-dependent
+        # and omitted in line with the accepted approximation for elementwise ops.
         act_name = "SiLU" if ffn_type == "swiglu" else "GELU"
-        ew_flops = 2 * B * s * ffn_h   # gate act + multiply
+        ew_flops = 2 * B * s * ffn_h   # approximate: act(gate) + gate*up
         ew = ComputeStats(
             name=f"{act_name} + multiply",
             flops=ew_flops,
@@ -91,6 +94,8 @@ def ffn_stats(
         up   = LinearStats("Up proj",   h, ffn_h, has_bias, s, B, dtype).compute()
         down = LinearStats("Down proj", ffn_h, h, has_bias, s, B, dtype).compute()
 
+        # FLOPs are an approximation: exact GELU cost (≈8–14 ops) is
+        # platform/precision-dependent; using 1 op per element is accepted.
         act_flops = B * s * ffn_h
         act = ComputeStats(
             name="Activation",

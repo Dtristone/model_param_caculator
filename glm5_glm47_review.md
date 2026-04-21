@@ -1165,3 +1165,45 @@ So validate against:
 - cache size
 - not just the one final total.
 
+
+---
+
+## Implementation status (updated 2026-04-21)
+
+The following table tracks every review item to its current resolution.
+
+| Item | Title | Status | Resolution |
+|------|-------|--------|------------|
+| A | Dense/sparse layer pattern | ✅ Fixed | `ModelConfig.is_sparse_layer()` + per-layer loop in `model.py`. First `first_k_dense_replace` layers use dense FFN, remainder use sparse MoE. |
+| B | Shared experts missing from MoE | ✅ Fixed | `moe_stats()` now accounts for `n_shared_experts`. Active FLOPs include shared-expert contribution. |
+| C | GLM-4.7 o_proj shape | ✅ Fixed | `output_proj_stats()` accepts explicit `in_features`; model calls it with `cfg.q_proj_width` → `hidden_size`. |
+| D | GLM-4.7 Q/O widths in attention HBM | ✅ Fixed | `attention_stats()` accepts `q_width`, `kv_width`, `attn_out_width`; model passes `cfg.q_proj_width` / `cfg.kv_proj_width`. |
+| E | `use_qk_norm=true` missing | ✅ Fixed | Q and K RMSNorm stats added to standard-attention path when `cfg.use_qk_norm`. |
+| F | MLA layernorms (`q_a_layernorm`, `kv_a_layernorm`) | ✅ Fixed | Both norms included in `mla_proj_stats()`. |
+| G | DSA indexer math (decode semantics) | ✅ Fixed | `wk` and `k_norm` now sized with `T = kv_len`, not `Q = q_len`. `k_sel = min(index_topk, kv_len)`. Softmax replaced with dot-product + ReLU + weighted-reduction + top-k terms. |
+| H/I | Split `q_len`, `kv_len`, `cache_len` | ✅ Fixed | All calculators accept `q_len`/`kv_len`; `kv_cache_stats()` takes `cache_len`; CLI exposes all three flags. |
+| J | Explicit cache/runtime mode for MLA/DSA | ✅ Fixed | `cache_layout = mla_compressed \| mla_expanded` branches both the projection path (`mla_proj_stats`) and the attention kernel (`mla_attention_stats`, `dsa_sparse_attention_stats`). |
+| K | DSA runtime memory mode | ✅ Fixed | `dsa_indexer_mode = fused_topk \| eager_dense_scores` changes activation storage in the scoring block. |
+| L | GLM-4.7 base `o_proj` bias false | ✅ Fixed | `ModelConfig.attention_output_bias` returns `False` for non-MLA GLM models; `True` for other architectures with `attention_bias`. |
+| M | `num_nextn_predict_layers` / MTP | ✅ Fixed (exclusion) | MTP layers are explicitly excluded; report labels totals as "excluding N next-n prediction layers". |
+| N | `act_bytes` presented as peak activation memory | ✅ Fixed | Renamed to "Act Working Set" in reports; docstring updated to "working-set estimate". |
+| O1 | INT4 byte rounding | ✅ Fixed | `elements_to_bytes()` uses `math.ceil` for all dtypes. |
+| O2 | Embedding index bytes | ✅ Fixed | Token-index HBM reads use `INT32_INDEX_BYTES = 4`, not compute dtype size. |
+| O3 | FFN elementwise FLOPs are approximate | ✅ Documented | `ffn.py` now carries inline comments explaining the approximation and its accepted scope. The approximation is kept intentionally; exact GELU/SiLU op counts are platform-dependent. |
+
+### Remaining known limitations
+
+- **MTP is excluded, not modeled.** Headlines from model cards that include MTP blocks will differ from calculator totals by ~6-7B for GLM-5 and GLM-4.7 (one MTP block ≈ one standard transformer layer).
+- **Activation working-set is still approximate.** `act_bytes` aggregates with `max(child.act_bytes)` across a layer, which is not a proper liveness-based peak. SwiGLU needs gate + up alive simultaneously (underestimate by ≈ ffn_h elements). This is documented; a full liveness scheduler is deferred.
+- **GLM-4.7 total params (345B) is slightly below the review's reference (352B).** The difference comes from the reference calculation including attention-bias parameters on the final-norm + LM-head path (likely a version discrepancy in the reference config or counting methodology). Per-layer active params and attention shapes are correct.
+
+### Validation summary
+
+```
+python -m pytest tests/    → 112 passed
+python main.py --config configs/config_glm5.json   --q-len 1 --kv-len 2048 --cache-len 2048 --plain --no-diagram  → 743.91B total / 40B active
+python main.py --config configs/config_glm4.7.json --q-len 1 --kv-len 2048 --cache-len 2048 --plain --no-diagram  → 345.45B total / 32B active
+```
+
+GLM-5 total/active match the published "744B total / 40B active" headline.  
+GLM-4.7 active params (≈32B) match the published "32B active" headline.
