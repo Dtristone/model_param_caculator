@@ -26,7 +26,7 @@ Notes
 
 from __future__ import annotations
 
-from .base import ComputeStats, DType
+from .base import ComputeStats
 from .ffn import ffn_stats
 from .linear import LinearStats
 
