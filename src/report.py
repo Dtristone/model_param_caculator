@@ -127,21 +127,21 @@ def _rich_report(ms: ModelStats) -> None:
 
     # ---- Per-layer breakdown ----------------------------------------------
     if ms.layer_breakdown:
-        for one in ms.layer_breakdown:
+        for layer in ms.layer_breakdown:
             layer_table = Table(
-                title=f"Per-Layer Component Breakdown ({one.name})",
+                title=f"Per-Layer Component Breakdown ({layer.name})",
                 box=rich_box.SIMPLE_HEAVY,
                 show_lines=True,
             )
             for col, sty in zip(cols, styles):
                 layer_table.add_column(col, style=sty, no_wrap=True)
 
-            for child in one.children:
-                layer_table.add_row(*_row(child, one.num_params, one.flops))
+            for child in layer.children:
+                layer_table.add_row(*_row(child, layer.num_params, layer.flops))
 
             layer_table.add_row(*["─" * 8] * len(cols))
             layer_table.add_row(
-                *_row(one, one.num_params, one.flops),
+                *_row(layer, layer.num_params, layer.flops),
                 style="bold",
             )
             console.print(layer_table)
@@ -306,9 +306,9 @@ def _plain_report(ms: ModelStats) -> None:
               f"{fmt_bytes(stats.weight_bytes):>10} {fmt_bytes(stats.hbm_total_bytes):>10}")
 
     print(f"\nPer-layer breakdown:")
-    for one in ms.layer_breakdown:
-        print(f"  [{one.name}]")
-        for child in one.children:
+    for layer in ms.layer_breakdown:
+        print(f"  [{layer.name}]")
+        for child in layer.children:
             print(f"    {child.name:<24} {fmt_num(child.num_params):>10} {fmt_num(child.flops):>10} "
                    f"{fmt_bytes(child.weight_bytes):>10} {fmt_bytes(child.hbm_total_bytes):>10}")
 

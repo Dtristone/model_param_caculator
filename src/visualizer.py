@@ -247,8 +247,9 @@ def visualize(cfg: ModelConfig, use_flash_attn: bool = False) -> str:
     # FFN
     if cfg.is_moe and cfg.num_experts > 1:
         expert_inter = cfg.moe_intermediate_size if cfg.moe_intermediate_size > 0 else cfg.intermediate_size
-        dense_prefix = f"Dense prefix: first {cfg.first_k_dense_replace} layers"
-        lines.append(_inner_line(dense_prefix, W))
+        if cfg.first_k_dense_replace > 0:
+            dense_prefix = f"Dense prefix: first {cfg.first_k_dense_replace} layers"
+            lines.append(_inner_line(dense_prefix, W))
         lines.append(_inner_line(f"Router  [{cfg.hidden_size} → {cfg.num_experts} experts]", W))
         lines.append(_inner_line(
             f"Expert FFN × {cfg.num_experts_per_tok}/{cfg.num_experts} (top-K)  "
