@@ -39,6 +39,7 @@ _DTYPE_BYTES = {
     DType.INT8: 1,
     DType.INT4: 0.5,
 }
+INT4_ELEMENTS_PER_BYTE = 2
 
 
 def dtype_bytes(dtype: DType | str) -> float:
@@ -53,7 +54,7 @@ def elements_to_bytes(num_elements: int | float, dtype: DType | str) -> int:
     if isinstance(dtype, str):
         dtype = DType(dtype.lower())
     if dtype == DType.INT4:
-        return math.ceil(num_elements / 2)
+        return math.ceil(num_elements / INT4_ELEMENTS_PER_BYTE)
     return int(num_elements * _DTYPE_BYTES[dtype])
 
 

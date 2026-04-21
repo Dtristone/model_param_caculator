@@ -610,7 +610,7 @@ class TestBaseHelpers:
 
     def test_int4_byte_rounding(self):
         assert elements_to_bytes(3, DType.INT4) == 2
-        assert elements_to_bytes(4, DType.INT4) == 2
+        assert elements_to_bytes(5, DType.INT4) == 3
 
     def test_compute_stats_add(self):
         a = ComputeStats("a", num_params=100, flops=200, weight_bytes=300,

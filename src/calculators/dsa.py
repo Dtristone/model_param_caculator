@@ -101,8 +101,8 @@ def dsa_indexer_stats(
     dense_score_elems = B * Q * idx_a * T
     index_bytes = B * Q * k_sel * INDEX_DTYPE_BYTES
     flops_qkt = 2 * B * Q * T * idx_a * idx_h
-    flops_relu = B * Q * T * idx_a
-    flops_weighted_sum = 2 * B * Q * T * idx_a
+    flops_relu = B * Q * T * idx_a  # ReLU activation over per-head dense scores
+    flops_weighted_sum = 2 * B * Q * T * idx_a  # Weighted reduction across index heads
     flops_topk = B * Q * k_sel
 
     stats.children.append(

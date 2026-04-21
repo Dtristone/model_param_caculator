@@ -144,7 +144,7 @@ def kv_cache_stats(
             # MLA: cache compressed latent + RoPE key
             k_per_token = kv_lora_rank + qk_rope_head_dim
             v_per_token = 0
-        total_per_token = k_per_token
+        total_per_token = k_per_token + v_per_token
         idx_per_token = index_head_dim if use_dsa else 0
         total_per_token += idx_per_token
         attn_type = "DSA+MLA" if use_dsa else "MLA"

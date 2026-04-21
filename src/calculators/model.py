@@ -92,6 +92,10 @@ def _qk_norm_stats(
     )
 
 
+def _layer_family_name(layer: ComputeStats) -> str:
+    return layer.name.split("[", 1)[0]
+
+
 # ---------------------------------------------------------------------------
 # Single transformer layer
 # ---------------------------------------------------------------------------
@@ -371,7 +375,7 @@ def model_stats(
             is_sparse=is_sparse,
         )
         all_layers += layer
-        if not representative_layers or representative_layers[-1].name.split("[", 1)[0] != layer.name.split("[", 1)[0]:
+        if not representative_layers or _layer_family_name(representative_layers[-1]) != _layer_family_name(layer):
             representative_layers.append(layer)
 
     result.per_layer = representative_layers[0] if representative_layers else ComputeStats("Per Layer")
