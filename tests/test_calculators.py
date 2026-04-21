@@ -386,7 +386,7 @@ class TestModelStats:
             f"Expected ~7.6B, got {fmt_num(ms.total.num_params)}"
 
     def test_glm4_9b_total_params(self):
-        """GLM-4.7 should have a reviewed total parameter count in the 300B-370B range."""
+        """GLM-4.7 should stay in the reviewed 300-370 billion parameter range."""
         cfg = _glm4_cfg()
         ms = model_stats(cfg, seq_len=1, batch_size=1)
         assert 3.0e11 < ms.total.num_params < 3.7e11, \
