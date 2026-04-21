@@ -77,7 +77,7 @@ class ComputeStats:
     weight_bytes : int
         Bytes required to store this component's parameters.
     act_bytes : int
-        Peak activation memory (bytes) needed during the forward pass.
+        Working-set activation memory estimate (bytes) for the forward pass.
     hbm_read_bytes : int
         Bytes read from HBM (weights + inputs).
     hbm_write_bytes : int

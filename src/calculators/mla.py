@@ -53,6 +53,7 @@ def mla_proj_stats(
     qk_nope_head_dim: int,
     qk_rope_head_dim: int,
     v_head_dim: int,
+    cache_layout: str = "mla_compressed",
     seq_len: int = 1,
     batch_size: int = 1,
     has_bias: bool = False,
@@ -101,13 +102,6 @@ def mla_proj_stats(
     )
 
     kv_b_params = c_kv * a * (d_n + v_dim)
-    stats.children.append(
-        ComputeStats(
-            name="KV up-proj weights (absorbed)",
-            num_params=kv_b_params,
-            weight_bytes=elements_to_bytes(kv_b_params, dtype),
-        )
-    )
 
     if c_q > 0:
         q_a = LinearStats(
@@ -144,31 +138,53 @@ def mla_proj_stats(
     ).compute()
     stats.children.append(q_b)
 
-    q_absorb_in = tokens * a * d_n
-    q_absorb_out = tokens * a * c_kv
-    q_absorb_weight = a * d_n * c_kv
-    stats.children.append(
-        ComputeStats(
-            name="Q absorb (q_nope × W_kc)",
-            flops=2 * tokens * a * d_n * c_kv,
-            act_bytes=elements_to_bytes(q_absorb_in + q_absorb_out, dtype),
-            hbm_read_bytes=elements_to_bytes(q_absorb_in + q_absorb_weight, dtype),
-            hbm_write_bytes=elements_to_bytes(q_absorb_out, dtype),
+    if cache_layout == "mla_expanded":
+        expanded_cache_out = tokens * a * (q_head_dim + v_dim)
+        stats.children.append(
+            ComputeStats(
+                name="KV up-proj + expanded cache",
+                num_params=kv_b_params,
+                flops=2 * tokens * a * c_kv * (d_n + v_dim),
+                weight_bytes=elements_to_bytes(kv_b_params, dtype),
+                act_bytes=elements_to_bytes(tokens * (c_kv + d_r) + expanded_cache_out, dtype),
+                hbm_read_bytes=elements_to_bytes(tokens * (c_kv + d_r) + kv_b_params, dtype),
+                hbm_write_bytes=elements_to_bytes(expanded_cache_out, dtype),
+            )
         )
-    )
+    else:
+        stats.children.append(
+            ComputeStats(
+                name="KV up-proj weights (absorbed)",
+                num_params=kv_b_params,
+                weight_bytes=elements_to_bytes(kv_b_params, dtype),
+            )
+        )
 
-    v_expand_in = tokens * a * c_kv
-    v_expand_out = tokens * a * v_dim
-    v_expand_weight = a * c_kv * v_dim
-    stats.children.append(
-        ComputeStats(
-            name="V expand (latent × W_vc)",
-            flops=2 * tokens * a * c_kv * v_dim,
-            act_bytes=elements_to_bytes(v_expand_in + v_expand_out, dtype),
-            hbm_read_bytes=elements_to_bytes(v_expand_in + v_expand_weight, dtype),
-            hbm_write_bytes=elements_to_bytes(v_expand_out, dtype),
+        q_absorb_in = tokens * a * d_n
+        q_absorb_out = tokens * a * c_kv
+        q_absorb_weight = a * d_n * c_kv
+        stats.children.append(
+            ComputeStats(
+                name="Q absorb (q_nope × W_kc)",
+                flops=2 * tokens * a * d_n * c_kv,
+                act_bytes=elements_to_bytes(q_absorb_in + q_absorb_out, dtype),
+                hbm_read_bytes=elements_to_bytes(q_absorb_in + q_absorb_weight, dtype),
+                hbm_write_bytes=elements_to_bytes(q_absorb_out, dtype),
+            )
         )
-    )
+
+        v_expand_in = tokens * a * c_kv
+        v_expand_out = tokens * a * v_dim
+        v_expand_weight = a * c_kv * v_dim
+        stats.children.append(
+            ComputeStats(
+                name="V expand (latent × W_vc)",
+                flops=2 * tokens * a * c_kv * v_dim,
+                act_bytes=elements_to_bytes(v_expand_in + v_expand_out, dtype),
+                hbm_read_bytes=elements_to_bytes(v_expand_in + v_expand_weight, dtype),
+                hbm_write_bytes=elements_to_bytes(v_expand_out, dtype),
+            )
+        )
 
     o_proj = LinearStats(
         name="O Projection",
@@ -192,6 +208,7 @@ def mla_attention_stats(
     qk_nope_head_dim: int,
     qk_rope_head_dim: int,
     v_head_dim: int,
+    cache_layout: str = "mla_compressed",
     seq_len: int = 1,
     batch_size: int = 1,
     use_flash_attn: bool = False,
@@ -201,42 +218,55 @@ def mla_attention_stats(
 ) -> ComputeStats:
     """Compute stats for the absorbed MLA attention kernel.
 
-    Attention runs in compressed latent space with:
-      QK^T dim = c_kv + d_r
-      AV dim   = c_kv
-
-    The latent -> value expansion via W_vc is accounted in `mla_proj_stats`.
+    Compressed mode runs in absorbed latent space and accounts for latent->value
+    expansion in `mla_proj_stats`. Expanded mode reads full per-head K/V cache.
     """
     B = batch_size
     a = num_q_heads
     c_kv = kv_lora_rank
     d_n = qk_nope_head_dim
     d_r = qk_rope_head_dim
+    v_dim = v_head_dim
     Q = q_len if q_len is not None else seq_len
     T = kv_len if kv_len is not None else seq_len
 
-    absorbed_dim = c_kv + d_r
+    q_head_dim = d_n + d_r
 
-    flops_qkt = 2 * B * a * Q * T * absorbed_dim
-    flops_av = 2 * B * a * Q * T * c_kv
+    if cache_layout == "mla_expanded":
+        flops_qkt = 2 * B * a * Q * T * q_head_dim
+        flops_av = 2 * B * a * Q * T * v_dim
+        q_elems = B * Q * a * q_head_dim
+        k_cache_elems = B * T * a * q_head_dim
+        v_cache_elems = B * T * a * v_dim
+        attn_out_elems = B * Q * a * v_dim
+        hbm_base_read = elements_to_bytes(q_elems + k_cache_elems + v_cache_elems, dtype)
+        hbm_base_write = elements_to_bytes(attn_out_elems, dtype)
+        mode_label = "expanded"
+    else:
+        absorbed_dim = c_kv + d_r
+        flops_qkt = 2 * B * a * Q * T * absorbed_dim
+        flops_av = 2 * B * a * Q * T * c_kv
+        q_elems = B * Q * a * q_head_dim
+        kv_cache_elems = B * T * absorbed_dim
+        attn_out_elems = B * Q * a * c_kv
+        hbm_base_read = elements_to_bytes(q_elems + kv_cache_elems, dtype)
+        hbm_base_write = elements_to_bytes(attn_out_elems, dtype)
+        mode_label = "absorbed"
+
     flops_softmax = 5 * B * a * Q * T
     total_flops = flops_qkt + flops_softmax + flops_av
 
-    q_elems = B * Q * a * (d_n + d_r)
-    kv_cache_elems = B * T * absorbed_dim
-    latent_out_elems = B * Q * a * c_kv
-
     if use_flash_attn:
-        hbm_read = elements_to_bytes(q_elems + kv_cache_elems, dtype)
-        hbm_write = elements_to_bytes(latent_out_elems, dtype)
+        hbm_read = hbm_base_read
+        hbm_write = hbm_base_write
         act_bytes = elements_to_bytes(2 * B * a * Q, dtype)
-        label = "MLA Flash Attention (absorbed)"
+        label = f"MLA Flash Attention ({mode_label})"
     else:
         attn_matrix = elements_to_bytes(B * a * Q * T, dtype)
-        hbm_read = elements_to_bytes(q_elems + kv_cache_elems, dtype) + attn_matrix
-        hbm_write = attn_matrix + elements_to_bytes(latent_out_elems, dtype)
+        hbm_read = hbm_base_read + attn_matrix
+        hbm_write = attn_matrix + hbm_base_write
         act_bytes = attn_matrix
-        label = "MLA Standard Attention (absorbed)"
+        label = f"MLA Standard Attention ({mode_label})"
 
     return ComputeStats(
         name=label,

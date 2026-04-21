@@ -140,6 +140,15 @@ class ModelConfig:
         return self.kv_lora_rank + self.qk_rope_head_dim
 
     @property
+    def attention_output_bias(self) -> bool:
+        """Return whether the attention output projection uses a bias term."""
+        if self.use_mla:
+            return self.attention_bias
+        if self.model_type.startswith("glm"):
+            return False
+        return self.attention_bias
+
+    @property
     def attention_type(self) -> str:
         """Return a human-readable attention type string."""
         if self.use_mla:

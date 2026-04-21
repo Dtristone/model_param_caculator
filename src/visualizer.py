@@ -178,7 +178,8 @@ def visualize(cfg: ModelConfig, use_flash_attn: bool = False) -> str:
         a = cfg.num_attention_heads
 
         lines.append(_inner_line(f"KV down-proj [{cfg.hidden_size} → {c_kv + d_r}]  (c_kv+d_r)", W))
-        kv_b_desc = f"KV up-proj   [{c_kv} → {a}×({d_n}+{v_dim})]  (absorbed)"
+        kv_proj_mode = "expanded cache" if cfg.cache_layout == "mla_expanded" else "absorbed"
+        kv_b_desc = f"KV up-proj   [{c_kv} → {a}×({d_n}+{v_dim})]  ({kv_proj_mode})"
         lines.append(_inner_line(kv_b_desc, W))
         if c_q > 0:
             lines.append(_inner_line(f"Q down-proj  [{cfg.hidden_size} → {c_q}]", W))
@@ -188,13 +189,15 @@ def visualize(cfg: ModelConfig, use_flash_attn: bool = False) -> str:
 
         if cfg.use_dsa:
             attn_mode = f"DSA top-{cfg.index_topk}"
-            prefix = f"── DSA+MLA Attention ({attn_mode}) "
+            runtime_mode = "expanded" if cfg.cache_layout == "mla_expanded" else "absorbed"
+            prefix = f"── DSA+MLA Attention ({runtime_mode}, {attn_mode}) "
             lines.append(_inner_line(prefix + "─" * max(0, inner_w - len(prefix)), W))
             idx_desc = f"Indexer: {cfg.index_n_heads}h×{cfg.index_head_dim}d"
             lines.append(_inner_line(idx_desc, W))
         else:
             attn_mode = "flash" if use_flash_attn else "std"
-            prefix = f"── MLA Attention (absorbed, {attn_mode}) "
+            runtime_mode = "expanded" if cfg.cache_layout == "mla_expanded" else "absorbed"
+            prefix = f"── MLA Attention ({runtime_mode}, {attn_mode}) "
             lines.append(_inner_line(prefix + "─" * max(0, inner_w - len(prefix)), W))
 
         lines.append(_inner_line(f"O proj       [{a}×{v_dim} → {cfg.hidden_size}]", W))

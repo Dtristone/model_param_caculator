@@ -135,6 +135,7 @@ def _transformer_layer_stats(
             qk_nope_head_dim=cfg.qk_nope_head_dim,
             qk_rope_head_dim=cfg.qk_rope_head_dim,
             v_head_dim=cfg.v_head_dim,
+            cache_layout=cfg.cache_layout,
             seq_len=q_tokens,
             batch_size=B,
             has_bias=cfg.attention_bias,
@@ -162,9 +163,11 @@ def _transformer_layer_stats(
             sparse_attn = dsa_sparse_attention_stats(
                 num_q_heads=cfg.num_attention_heads,
                 kv_lora_rank=cfg.kv_lora_rank,
+                qk_nope_head_dim=cfg.qk_nope_head_dim,
                 qk_rope_head_dim=cfg.qk_rope_head_dim,
                 v_head_dim=cfg.v_head_dim,
                 index_topk=cfg.index_topk,
+                cache_layout=cfg.cache_layout,
                 seq_len=q_tokens,
                 batch_size=B,
                 dtype=dtype,
@@ -180,6 +183,7 @@ def _transformer_layer_stats(
                 qk_nope_head_dim=cfg.qk_nope_head_dim,
                 qk_rope_head_dim=cfg.qk_rope_head_dim,
                 v_head_dim=cfg.v_head_dim,
+                cache_layout=cfg.cache_layout,
                 seq_len=q_tokens,
                 batch_size=B,
                 use_flash_attn=use_flash_attn,
@@ -246,7 +250,7 @@ def _transformer_layer_stats(
             out_features=h,
             seq_len=q_tokens,
             batch_size=B,
-            has_bias=False,
+            has_bias=cfg.attention_output_bias,
             dtype=dtype,
         )
         layer.children.append(o_proj)

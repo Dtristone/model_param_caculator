@@ -820,6 +820,7 @@ class TestDSAStats:
 
         sparse = dsa_sparse_attention_stats(
             num_q_heads=a, kv_lora_rank=c_kv,
+            qk_nope_head_dim=128,
             qk_rope_head_dim=d_r, v_head_dim=v_dim,
             index_topk=k_sel, seq_len=s,
         )
@@ -834,6 +835,7 @@ class TestDSAStats:
         """When seq_len < index_topk, effective k_sel = seq_len."""
         sparse_short = dsa_sparse_attention_stats(
             num_q_heads=32, kv_lora_rank=512,
+            qk_nope_head_dim=128,
             qk_rope_head_dim=64, v_head_dim=128,
             index_topk=2048, seq_len=512,  # seq_len < topk
         )
@@ -851,10 +853,85 @@ class TestDSAStats:
         """Sparse attention kernel has no learnable params."""
         s = dsa_sparse_attention_stats(
             num_q_heads=32, kv_lora_rank=512,
+            qk_nope_head_dim=128,
             qk_rope_head_dim=64, v_head_dim=128,
             index_topk=2048, seq_len=4096,
         )
         assert s.num_params == 0
+
+    def test_indexer_k_path_scales_with_kv_len(self):
+        """Indexer K projection and norm should scale with KV length in decode mode."""
+        B, Q, T = 1, 1, 2048
+        h, idx_h = 4096, 128
+        stats = dsa_indexer_stats(
+            hidden_size=h,
+            q_lora_rank=1536,
+            index_n_heads=8,
+            index_head_dim=idx_h,
+            index_topk=256,
+            batch_size=B,
+            q_len=Q,
+            kv_len=T,
+            dtype=DType.BF16,
+        )
+        wk = next(child for child in stats.children if child.name == "Indexer K proj (wk)")
+        k_norm = next(child for child in stats.children if child.name == "Indexer K norm")
+        assert wk.flops == 2 * B * T * h * idx_h
+        assert k_norm.act_bytes == B * T * idx_h * 2
+
+    def test_indexer_mode_affects_activation_memory(self):
+        fused = dsa_indexer_stats(
+            hidden_size=4096,
+            q_lora_rank=1536,
+            index_n_heads=8,
+            index_head_dim=128,
+            index_topk=64,
+            q_len=8,
+            kv_len=4096,
+            indexer_mode="fused_topk",
+            dtype=DType.BF16,
+        )
+        eager = dsa_indexer_stats(
+            hidden_size=4096,
+            q_lora_rank=1536,
+            index_n_heads=8,
+            index_head_dim=128,
+            index_topk=64,
+            q_len=8,
+            kv_len=4096,
+            indexer_mode="eager_dense_scores",
+            dtype=DType.BF16,
+        )
+        fused_score = next(child for child in fused.children if "Index top-k scoring" in child.name)
+        eager_score = next(child for child in eager.children if "Index top-k scoring" in child.name)
+        assert eager_score.act_bytes > fused_score.act_bytes
+
+    def test_sparse_attn_expanded_cache_reads_full_kv(self):
+        compressed = dsa_sparse_attention_stats(
+            num_q_heads=32,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            index_topk=64,
+            q_len=1,
+            kv_len=2048,
+            cache_layout="mla_compressed",
+            dtype=DType.BF16,
+        )
+        expanded = dsa_sparse_attention_stats(
+            num_q_heads=32,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            index_topk=64,
+            q_len=1,
+            kv_len=2048,
+            cache_layout="mla_expanded",
+            dtype=DType.BF16,
+        )
+        assert expanded.hbm_read_bytes > compressed.hbm_read_bytes
 
 
 # ---------------------------------------------------------------------------
@@ -1040,6 +1117,23 @@ class TestConfigParserMLA:
         assert cfg.use_mla is True
         assert cfg.kv_lora_rank == 512
 
+    def test_attention_output_bias_is_architecture_specific(self):
+        glm_cfg = _glm4_cfg()
+        assert glm_cfg.attention_output_bias is False
+
+        qwen_cfg = from_dict(
+            {
+                "model_type": "qwen2",
+                "hidden_size": 1024,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 8,
+                "num_key_value_heads": 8,
+                "intermediate_size": 4096,
+                "attention_bias": True,
+            }
+        )
+        assert qwen_cfg.attention_output_bias is True
+
 
 # ---------------------------------------------------------------------------
 # 14. Full model stats (MLA and DSA models)
@@ -1082,6 +1176,32 @@ class TestModelStatsMLA:
         layer = ms.layer_breakdown[0]
         child_names = [c.name for c in layer.children]
         assert "MLA Projection" in child_names
+
+    def test_glm5_uses_expanded_runtime_labels(self):
+        cfg = _glm5_cfg()
+        ms = model_stats(cfg, q_len=1, kv_len=2048, cache_len=2048, batch_size=1)
+        sparse_layer = next(layer for layer in ms.layer_breakdown if "Sparse" in layer.name)
+        attn = next(child for child in sparse_layer.children if "DSA Sparse MLA" in child.name)
+        proj = next(child for child in sparse_layer.children if child.name == "MLA Projection")
+        proj_child_names = [child.name for child in proj.children]
+        assert attn.hbm_read_bytes > attn.hbm_write_bytes
+        assert "KV up-proj + expanded cache" in proj_child_names
+        assert all("Q absorb" not in name for name in proj_child_names)
+
+    def test_mla_attention_expanded_cache_costs_more_hbm(self):
+        kwargs = dict(
+            num_q_heads=16,
+            kv_lora_rank=512,
+            qk_nope_head_dim=128,
+            qk_rope_head_dim=64,
+            v_head_dim=128,
+            q_len=1,
+            kv_len=2048,
+            dtype=DType.BF16,
+        )
+        compressed = mla_attention_stats(**kwargs, cache_layout="mla_compressed", use_flash_attn=True)
+        expanded = mla_attention_stats(**kwargs, cache_layout="mla_expanded", use_flash_attn=True)
+        assert expanded.hbm_read_bytes > compressed.hbm_read_bytes
 
     def test_kv_cache_with_hit_ratio(self):
         """KV hit ratio should propagate to model stats."""

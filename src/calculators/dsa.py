@@ -65,7 +65,7 @@ def dsa_indexer_stats(
             in_features=hidden_size,
             out_features=idx_h,
             has_bias=False,
-            seq_len=Q,
+            seq_len=T,
             batch_size=batch_size,
             dtype=dtype,
         ).compute()
@@ -87,11 +87,11 @@ def dsa_indexer_stats(
         ComputeStats(
             name="Indexer K norm",
             num_params=k_norm_params,
-            flops=4 * B * Q * idx_h,  # RMSNorm: mean-sq + rsqrt + normalize + scale
+            flops=4 * B * T * idx_h,  # RMSNorm: mean-sq + rsqrt + normalize + scale
             weight_bytes=elements_to_bytes(k_norm_params, dtype),
-            hbm_read_bytes=elements_to_bytes(B * Q * idx_h + k_norm_params, dtype),
-            hbm_write_bytes=elements_to_bytes(B * Q * idx_h, dtype),
-            act_bytes=elements_to_bytes(B * Q * idx_h, dtype),
+            hbm_read_bytes=elements_to_bytes(B * T * idx_h + k_norm_params, dtype),
+            hbm_write_bytes=elements_to_bytes(B * T * idx_h, dtype),
+            act_bytes=elements_to_bytes(B * T * idx_h, dtype),
         )
     )
 
@@ -131,9 +131,11 @@ def dsa_indexer_stats(
 def dsa_sparse_attention_stats(
     num_q_heads: int,
     kv_lora_rank: int,
+    qk_nope_head_dim: int,
     qk_rope_head_dim: int,
     v_head_dim: int,
     index_topk: int,
+    cache_layout: str = "mla_compressed",
     seq_len: int = 1,
     batch_size: int = 1,
     dtype: DType = DType.BF16,
@@ -151,26 +153,38 @@ def dsa_sparse_attention_stats(
     a = num_q_heads
     c_kv = kv_lora_rank
     d_r = qk_rope_head_dim
+    v_dim = v_head_dim
     Q = q_len if q_len is not None else seq_len
     T = kv_len if kv_len is not None else seq_len
 
     k_sel = min(index_topk, T)
-    absorbed_dim = c_kv + d_r
+    q_head_dim = qk_nope_head_dim + d_r
 
-    flops_qkt = 2 * B * a * Q * k_sel * absorbed_dim
-    flops_av = 2 * B * a * Q * k_sel * c_kv
+    if cache_layout == "mla_expanded":
+        flops_qkt = 2 * B * a * Q * k_sel * q_head_dim
+        flops_av = 2 * B * a * Q * k_sel * v_dim
+        q_elems = B * Q * a * q_head_dim
+        gathered_k_elems = B * Q * k_sel * a * q_head_dim
+        gathered_v_elems = B * Q * k_sel * a * v_dim
+        out_elems = B * Q * a * v_dim
+    else:
+        absorbed_dim = c_kv + d_r
+        flops_qkt = 2 * B * a * Q * k_sel * absorbed_dim
+        flops_av = 2 * B * a * Q * k_sel * c_kv
+        q_elems = B * Q * a * q_head_dim
+        gathered_k_elems = B * Q * k_sel * absorbed_dim
+        gathered_v_elems = 0
+        out_elems = B * Q * a * c_kv
+
     flops_softmax = 5 * B * a * Q * k_sel
     total_flops = flops_qkt + flops_softmax + flops_av
 
-    q_elems = B * Q * a * absorbed_dim
-    gathered_kv_elems = B * Q * k_sel * absorbed_dim
-    latent_out_elems = B * Q * a * c_kv
     index_read_bytes = B * Q * k_sel * INDEX_DTYPE_BYTES
 
     return ComputeStats(
         name=f"DSA Sparse MLA (top-{k_sel})",
         flops=total_flops,
         act_bytes=elements_to_bytes(B * a * Q * k_sel, dtype),
-        hbm_read_bytes=elements_to_bytes(q_elems + gathered_kv_elems, dtype) + index_read_bytes,
-        hbm_write_bytes=elements_to_bytes(latent_out_elems, dtype),
+        hbm_read_bytes=elements_to_bytes(q_elems + gathered_k_elems + gathered_v_elems, dtype) + index_read_bytes,
+        hbm_write_bytes=elements_to_bytes(out_elems, dtype),
     )

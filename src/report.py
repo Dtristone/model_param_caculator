@@ -103,7 +103,7 @@ def _rich_report(ms: ModelStats) -> None:
         show_lines=True,
     )
     cols = ["Component", "Params", "Param%", "FLOPs", "FLOPs%",
-            "Weight Mem", "Peak Act Mem", "HBM Traffic", "Arith.Int."]
+            "Weight Mem", "Act Working Set", "HBM Traffic", "Arith.Int."]
     styles = ["bold", "", "dim", "", "dim", "cyan", "magenta", "yellow", "green"]
     for col, sty in zip(cols, styles):
         table.add_column(col, style=sty, no_wrap=True)
@@ -219,7 +219,7 @@ def _attn_comparison(console, ms: ModelStats) -> None:
     tbl.add_row("HBM Traffic",
                 fmt_bytes(std.hbm_total_bytes), fmt_bytes(flash.hbm_total_bytes),
                 ratio(std.hbm_total_bytes, flash.hbm_total_bytes))
-    tbl.add_row("Peak Act Mem",
+    tbl.add_row("Act Working Set",
                 fmt_bytes(std.act_bytes), fmt_bytes(flash.act_bytes),
                 ratio(std.act_bytes, flash.act_bytes))
     tbl.add_row("Arith. Intensity",
