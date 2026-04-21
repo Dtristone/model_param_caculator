@@ -95,6 +95,9 @@ class ModelConfig:
         if self.num_key_value_heads <= 0:
             self.num_key_value_heads = self.num_attention_heads
         if self.qk_head_dim <= 0:
+            # Prefer the explicit MLA split when present. Otherwise fall back to
+            # the standard attention head width so expanded-cache reporting still
+            # has a usable per-head width on partially specified configs.
             inferred_qk = self.qk_nope_head_dim + self.qk_rope_head_dim
             self.qk_head_dim = inferred_qk if inferred_qk > 0 else self.head_dim
         if self.first_k_dense_replace < 0:

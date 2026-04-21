@@ -55,7 +55,7 @@ def elements_to_bytes(num_elements: int | float, dtype: DType | str) -> int:
         dtype = DType(dtype.lower())
     if dtype == DType.INT4:
         return math.ceil(num_elements / INT4_ELEMENTS_PER_BYTE)
-    return int(num_elements * _DTYPE_BYTES[dtype])
+    return math.ceil(num_elements * _DTYPE_BYTES[dtype])
 
 
 # ---------------------------------------------------------------------------

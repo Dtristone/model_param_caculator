@@ -32,7 +32,7 @@ from .mla import mla_proj_stats, mla_attention_stats
 from .dsa import dsa_indexer_stats, dsa_sparse_attention_stats
 from .kv_cache import kv_cache_stats, KVCacheStats
 
-TOKEN_INDEX_BYTES = 4
+INT32_INDEX_BYTES = 4
 
 
 # ---------------------------------------------------------------------------
@@ -359,7 +359,7 @@ def model_stats(
         flops=0,          # look-up, not multiply-add
         weight_bytes=emb_w,
         act_bytes=elements_to_bytes(B * q_tokens * h, dtype),
-        hbm_read_bytes=B * q_tokens * TOKEN_INDEX_BYTES + elements_to_bytes(B * q_tokens * h, dtype),
+        hbm_read_bytes=B * q_tokens * INT32_INDEX_BYTES + elements_to_bytes(B * q_tokens * h, dtype),
         hbm_write_bytes=elements_to_bytes(B * q_tokens * h, dtype),
     )
 
